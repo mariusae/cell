@@ -82,6 +82,12 @@ serializable, and has a known structure. That makes it a *pytree*: the
 tracer can flatten and rebuild it (§5.3), and operations on it (field
 access, indexing) are known to be pure.
 
+Pytrees are also the basis for vectorization later (§10). As in JAX's
+`vmap`, a vector of values is represented leaf by leaf: a vector of
+`User`s becomes one `User`-shaped tree whose leaves are vectors. So
+getting data types right now is a prerequisite for vmap, not only for
+tracing.
+
 ### 1.3 Ops
 
 ```python
@@ -119,6 +125,67 @@ Plain helpers, sync or async, that take ctx and call cells are fine. The
 tracer sees through them. **Cell boundaries mark where policy applies,
 not how code is organized.**
 
+### 1.5 Passing handles (pushdown)
+
+A handle can be passed to a call without awaiting it first:
+
+```python
+if user.tier == "premium":
+    ranked = await rank(ctx, items, prefs)     # handles, not values
+```
+
+This pushes the reference down into the call, and the value is resolved
+where it is needed. The caller never waits for `items` or `prefs`, and
+never has to hold their values. This is *promise pipelining*, as in the E
+language and Cap'n Proto.
+
+Rules:
+
+- **Where a handle may go.** A `Handle[T]` may be passed anywhere a `T`
+  is expected by a cell: as an argument, or as a leaf inside data
+  (`Req(items=items)`).
+- **Issue vs. start.** The call is *issued* at the call site, in program
+  order. Its `seq`, effect edges and effect domain are the same as for
+  any call. It *starts* only when its handle arguments have resolved.
+- **Projection doesn't wait.** `prefs.weights` and `items[0]` on a
+  handle give a handle to the field or element. Anything that needs the
+  actual value (ops, branching, arithmetic) requires an `await`.
+- **Errors.** If a handle argument fails, the call fails with that error
+  before it starts. The callee never runs, so an effectful callee has no
+  effect. The error surfaces at the `await` of the call rather than at an
+  `await` of the handle. The cell's outcome is the same error.
+- **Passing a handle doesn't observe it.** So it creates no path edge
+  (§4.3) for later effects. This is the real semantic difference from
+  `rank(ctx, await items, await prefs)`: the caller no longer depends on
+  `items` and `prefs` having succeeded. Only `rank` does.
+
+**Where the value is resolved.** Locally, the resolver just waits for the
+arguments before starting the callee. When execution is distributed
+(§10), the value travels along the data edge directly from producer to
+consumer, and never passes through the caller. This is the same
+behavior the dataflow model gives compiled graphs (NOTES §11), made
+available to eager code.
+
+**In the graph** nothing new is needed. A data edge already *is* a
+reference:
+
+```
+%8 = call rank(%4, %3)       # same node whether or not the caller awaited
+```
+
+The only difference is that `%4` and `%3` are not observed, so later
+effects get no path edges to them. Compiled mode therefore already
+behaves this way whenever nothing observes the values. The explicit form
+matters for eager mode, for distribution, and for making the intent
+clear.
+
+**Later: lazy parameters.** By default a callee is strict: it starts
+when all its arguments have resolved. That keeps cell bodies plain and
+vectorization simple. A callee could instead declare a parameter as
+`Ref[T]` and receive the handle itself. It could then start work before
+the argument is ready, await it only on the paths that need it
+(call-by-need), or pass it further down without materializing it.
+
 ---
 
 ## 2. Execution modes
@@ -138,8 +205,12 @@ difference.
 
 > Compiled(C, x, R) and Eager(C, x, R) produce the same result or error,
 > and the same *effectful* calls (cell and args), in orders consistent
-> with each other. Compiled may additionally issue *pure* calls
-> speculatively.
+> with the ordering C's effect domains require (§4.4). Compiled may
+> additionally issue *pure* calls speculatively.
+
+With the default single domain, this is exactly eager's order. Declaring
+other domains relaxes the program's meaning, so eager's sequential order
+becomes one of several allowed orders (§4.4).
 
 Here "call results R" means that each call receives the same result for
 the same (cell, args) in both runs. §7 gives the argument for why the
@@ -180,6 +251,13 @@ each issued call, look up its key:
   a determinism violation. Fail loudly. §7 explains why this can't happen
   if the invariants hold.
 
+**Unconsumed entries.** When replay ends, the journal may still hold
+effectful calls that replay never reached. This happens only when effect
+domains are relaxed (§4.4): an effect in another domain ran ahead of a
+call that then failed. These effects did happen. Replay waits for them to
+complete (structured concurrency) and reports them with the cell's
+outcome, so that EXPLAIN ANALYZE, and later durability, account for them.
+
 ---
 
 ## 4. Graph IR
@@ -203,7 +281,8 @@ Node
   id:        NodeId              # also its ValueId, if it produces a value
   kind:      param | const | call | op | pack | source | guard | deopt | return
   inputs:    [ValueId]           # data dependencies
-  ctrl:      [NodeId]            # control dependencies (§4.3)
+  path:      [NodeId]            # path edges (§4.3)
+  effect:    [NodeId]            # effect edges, within a domain (§4.3, §4.4)
   attrs:     kind-specific
   site:      file:line           # for EXPLAIN and diagnostics
 ```
@@ -214,7 +293,7 @@ Node
 |---|---|---|---|
 | `param` | — | index, type | A cell input |
 | `const` | — | value (data) | A literal or a captured constant |
-| `call` | args (one per parameter) | cell ref, semantics (pure/effectful), `seq` | Issue a call to a cell |
+| `call` | args (one per parameter) | cell ref, semantics (pure/effectful), effect domain, `seq` | Issue a call to a cell |
 | `op` | args | op ref (name + code hash), or a builtin (§5.2) | Pure local computation |
 | `pack` | leaves | treedef (structure) | Build a data value from its leaves |
 | `source` | — | `now` \| `random` \| `config(key)` | Nondeterminism through ctx; journaled |
@@ -235,26 +314,121 @@ and wrong for effectful ones. The rules:
   only by data edges. They may run earlier than in eager, including
   speculatively before a guard that precedes them in program order. The
   cost of a failed speculation is only wasted work.
-- **Effectful calls** get control edges to every node that was *observed*
-  before the call was issued, in program order. A node is observed when
-  user code consumes its value:
+- **Effectful calls** get two kinds of control edges. Both refer to nodes
+  *observed* before the call was issued, in program order. A node is
+  observed when user code consumes its value:
   - a call is observed when awaited,
   - an op when it evaluates,
   - a guard when it is checked.
 
-  Eager execution only reaches an effectful call if all of those
-  succeeded and passed. The control edges make compiled execution
-  require the same.
-- **Effectful calls are totally ordered with each other** in program
-  order (a control edge to the previous effectful call's *issue*). v0 is
-  conservative here. Declared `reads`/`writes` sets let a later pass drop
-  edges between calls that commute.
+  The two kinds:
+
+  - **Path edges** go to every observed guard, op and *pure* call. They
+    ensure the effect happens only on the path eager would take, and only
+    if the values that led to it were computed without error. **Path
+    edges are never relaxed.**
+  - **Effect edges** go to other effectful calls *in the same effect
+    domain* (§4.4):
+    - to the *issue* of the previous effect in the domain, so effects in
+      a domain are issued in program order, and
+    - to the *completion* of every observed effect in the domain, so an
+      effect proceeds only if the earlier ones it waited for in eager
+      succeeded.
+
+  With the default single domain (`main`), this is exactly eager's
+  behavior: an effect runs only if everything before it succeeded and
+  passed.
 - **`source` nodes** are journaled, so they are ordered only by data.
 
 Calls issued but not yet awaited before an effectful call are *not* its
 control dependencies, because eager doesn't wait for them either.
 
-### 4.4 Identity and serialization
+Data edges always apply, whatever the domains. If an effect uses another
+effect's result, or code branches on it, the data edge or the guard's
+path edge orders them.
+
+### 4.4 Effect domains
+
+By default, every effect in a cell body is in the domain `main` and is
+ordered with every other effect, as above. This is safe but
+over-constrained. An audit-log write awaited at the top of `checkout`
+would hold up the reservation until the log write completes, and a failed
+log write would cancel the order.
+
+An **effect domain** relaxes this. Effects are ordered, by effect edges,
+only with other effects in the *same* domain. Effects in different
+domains are ordered only by data and path edges.
+
+```python
+@cell(effects("audit"), domain="audit")      # the cell's default domain
+async def audit(ctx, event: Event) -> None: ...
+
+@cell(effects("email"), domain=UNIQUE)       # every call is its own domain
+async def notify(ctx, receipt: Receipt) -> None: ...
+
+@cell
+async def checkout(ctx, order: Order) -> Receipt:
+    await audit(ctx, Attempt(order.id))      # "audit"
+    await reserve(ctx, order)                # main
+    receipt = await charge(ctx, order)       # main: after reserve
+    await notify(ctx, receipt)               # own domain: after charge, via data
+    await audit(ctx, Charged(receipt.id))    # "audit": after Attempt (domain) and charge (data)
+    return receipt
+```
+
+In this example:
+
+- `reserve` no longer waits for the first audit write.
+- `notify` still runs after `charge`, because it uses `receipt`.
+- The second audit write is ordered after the first by its domain, and
+  after `charge` by data.
+
+**Where the domain comes from.** Ordering is a relation between calls in
+the *caller's* body, so a domain is fundamentally a property of the call
+site. A cell declares a default domain for calls to it (as above). A call
+site can override it:
+
+```python
+with ctx.domain("audit"):
+    await write_metrics(ctx, m)
+```
+
+Domain names are scoped to the calling cell's body. The special domain
+`UNIQUE` makes every call a singleton domain: it has no effect edges at
+all, not even with other calls to the same cell.
+
+**Meaning.** A domain declaration is an assertion by the author: *effects
+in this domain don't depend on effects in other domains having happened,
+or having succeeded, unless there is a data or path dependency.* This
+changes the program's meaning, and the reference semantics change with
+it:
+
+- Effects form a **partial order**: program order within each domain,
+  plus data and path edges.
+- A failed effect gates later effects **in its own domain only**. The
+  failure still surfaces at its `await` and fails the cell as usual.
+- As a result, when a cell fails, effects in *other* domains that come
+  later in program order may already have happened. Replay reports them
+  as unconsumed journal entries (§3).
+
+Eager's sequential run is one linearization of this partial order, so
+eager remains a correct implementation. With only `main`, the partial
+order is total and nothing changes. The analogy is a memory model:
+`main` is sequential consistency, and domains are declared relaxations.
+
+**Domains never relax path edges.** Letting an effect run before the
+guards that lead to it would mean running effects on paths eager doesn't
+take. That is *speculating effects*. It needs a different semantic
+(compensable or reservation-style effects) and is future work.
+
+**Relation to reads/writes.** Domains express the author's intent about
+ordering between call sites. Declared `reads`/`writes` sets (NOTES §3)
+are about which effects commute. A later pass can use commutativity to
+drop effect edges *within* a domain. The two are complementary. A planner
+could also propose default domains from write sets, but only the author
+can assert the independence a domain promises.
+
+### 4.5 Identity and serialization
 
 - **Graph identity** is a content hash of the normalized node list: kinds,
   attrs, edges, and the hashes of the cells and ops it references. The
@@ -268,7 +442,7 @@ control dependencies, because eager doesn't wait for them either.
   *annotations* keyed by node ID, so the logical graph stays stable and
   can be diffed.
 
-### 4.5 Example
+### 4.6 Example
 
 ```python
 @op
@@ -295,7 +469,7 @@ graph home #3f2a9c  (uid: int) -> Page
   %0  = param 0 : int
   %1  = call get_user(%0)            pure        seq=0   home.py:14
   %2  = op getattr(%1, "id")                             home.py:15
-  %3  = call get_prefs(%2)           effectful   seq=1   home.py:15  ctrl=[%1]
+  %3  = call get_prefs(%2)           effectful   seq=1   home.py:15  path=[%1]
   %4  = call get_items(%0)           pure        seq=2   home.py:16
   %5  = op getattr(%1, "tier")                           home.py:17
   %6  = op eq(%5, "premium")                             home.py:17
@@ -311,7 +485,7 @@ Things to notice:
 - **`get_items` doesn't depend on `get_user`.** Program order serialized
   them; the graph doesn't, so compiled mode runs them in parallel. This is
   the first optimization tracing gives us for free.
-- **`get_prefs` has `ctrl=[%1]`.** Eager only reaches it after
+- **`get_prefs` has `path=[%1]`.** Eager only reaches it after
   `await get_user` has succeeded.
 - **`rank` can start speculatively before `%7` is checked,** because it
   is pure.
@@ -350,6 +524,8 @@ In trace mode `ctx` is a `TracingCtx`. It:
 | Operation | Recorded as | Notes |
 |---|---|---|
 | Pass to a cell call | `call` input | Nested tracers are flattened and packed (§5.3) |
+| Pass an *unawaited handle* to a cell call | `call` input | Data edge, not observed (§1.5) |
+| `.field`, `[i]` on an unawaited handle | `op getattr` / `op getitem` | Projection; not observed (§1.5) |
 | Pass to an `@op` | `op` node | The op runs on unwrapped concrete values; its result is wrapped |
 | `.field` on data | `op getattr` | Allowed only on data types (§1.2), so it is known to be pure |
 | `[i]`, `[k]` | `op getitem` | |
@@ -523,17 +699,27 @@ path. The reason: every branch the eager body takes depends only on
 traced values (A2), and every such dependency is a guard that passed. By
 A1, eager computes the same arguments for the same calls and the same
 result. G's effectful calls are exactly eager's, because an effectful call
-was recorded only on the traced path, and the guards pin that path. They
-run in an order consistent with eager's, because of the control edges of
-§4.3.
+was recorded only on the traced path, and the guards pin that path. Their
+order is consistent with the partial order the domains require (§4.4),
+because of the effect edges. With only `main`, that is eager's order.
 
-**Claim (with deopt).** Every effectful call issued before the failure
-has control edges to all nodes observed before it in program order, and
-all of those passed. So eager would also have issued it, with the same
-arguments (data edges) and at the same `seq`. Replay therefore hits it in
-the journal and does not re-execute it. From then on, execution is plain
-eager. So the combined execution is exactly eager's, apart from the pure
-calls that were speculated.
+**Claim (with deopt).** Take any effectful call E that was issued before
+the failure. Its path edges passed: every guard, op and pure call observed
+before it in program order had succeeded. So E is on eager's path, and
+it has the same arguments (data edges) and the same `seq`. There are two
+cases:
+
+- **Nothing before E in program order fails in eager.** Then eager
+  reaches E, replay hits it in the journal, and E is not re-executed.
+- **An effect X before E in program order fails.** Because E didn't wait
+  for X, X must be in a different domain. Eager raises at X and never
+  reaches E, so E stays unconsumed. The domain semantics (§4.4) allow
+  exactly this: a failure gates only its own domain.
+
+From the failure onward, execution is plain eager. So the combined
+execution is an allowed behavior of C. With only `main`, the second case
+can't occur, and the result is exactly eager's, apart from the pure calls
+that were speculated.
 
 **Where it can break:** only through a violation of A1 or A2. A1
 violations are caught by the mismatch check in §3 and by lint. A2
@@ -612,11 +798,13 @@ The v0 IR avoids decisions that would block these:
   vectorizes and doesn't need a length guard.
 - **Partitioning.** Placement is an annotation on nodes. A pass inserts
   `send`/`recv` edges between partitions, and each partition becomes its
-  own graph (endpoint projection).
+  own graph (endpoint projection). A data edge between partitions sends
+  the value directly from producer to consumer, which is how handles
+  passed through a caller (§1.5) avoid a round trip through it.
 - **Planner rewrites** as graph-to-graph passes: dedup of identical pure
   calls, caching (wrap a pure call), dropping ordering edges between
   commuting effectful calls, inlining.
-- **EXPLAIN** is the printer in §4.5, plus annotations. **EXPLAIN
+- **EXPLAIN** is the printer in §4.6, plus annotations. **EXPLAIN
   ANALYZE** is the same view, overlaid with a trace's timings and
   outcomes.
 
@@ -643,7 +831,7 @@ so the benefit of each idea can be measured locally.
 
 **Example applications** (each exercises different parts):
 
-1. **Home page:** the §4.5 example. Fan-out, a branch, parallelism
+1. **Home page:** the §4.6 example. Fan-out, a branch, parallelism
    recovered from program order.
 2. **Feed with ranking:** a fan-out over items (`ctx.map`), a vectorized
    feature lookup and ranker. Cross-request vectorization.
@@ -666,10 +854,103 @@ so the benefit of each idea can be measured locally.
    Needs a spike.
 4. **Guarding on values.** Should small enums be allowed as guard values
    (guard `tier == "premium"`), beyond booleans and lengths? The `eq`
-   op plus a boolean guard in §4.5 already covers the common case.
+   op plus a boolean guard in §4.6 already covers the common case.
 5. **Errors of unawaited calls.** The rule in §1.4 is a first cut.
 6. **Where do op code hashes come from:** the op's source only, or its
    transitive dependencies? Content-addressing (Unison-style) is the
    principled answer; source-plus-deploy-version is the practical one.
 7. **Trace sampling policy and trace storage format,** including how much
    argument data to keep.
+
+---
+
+## 13. Design points to resolve
+
+These came out of the effect-domain (§4.4) and pushdown (§1.5) designs.
+Each one needs a decision before the feature it affects is built. The
+v0 defaults are chosen so that none of them blocks M0–M2.
+
+### 13.1 Domains whose failures don't fail the cell
+
+**Question.** In §4.4, a failure in any domain still surfaces at its
+`await` and fails the cell. Should a domain be able to declare that its
+failures are handled by policy instead, and don't fail the cell? An
+example is an audit or metrics write that is fire-and-forget, or retried
+durably in the background.
+
+**Considerations.**
+- This would be a separate declaration from ordering. A domain says what
+  is ordered; this says what happens when something fails.
+- It interacts with `requires=completes` (NOTES §5). "Doesn't fail the
+  cell" is only safe if something else guarantees the effect eventually
+  happens, or if losing it is acceptable.
+- Once the cell no longer waits for these effects, the caller can't
+  observe their results. They could only be awaited for their value,
+  which conflicts with fire-and-forget.
+
+**v0 default.** Every failure fails the cell.
+
+### 13.2 A fence across domains
+
+**Question.** Is a `ctx.fence()` needed? It would wait for every effect
+issued so far, in all domains, before any later effect is issued.
+
+**Considerations.**
+- A fence expresses "everything before this point has happened" without
+  folding the effects back into `main`, for example before replying to a
+  client or handing off to another system.
+- Data dependencies and `main` may always be enough. A fence might only
+  be a convenience for a pattern that could be written another way.
+- In the graph, a fence would be a node with effect edges from all
+  domains, and it would be a barrier for later effects.
+
+**v0 default.** No fence. Revisit when the example apps need one.
+
+### 13.3 Checking that a domain declaration is correct
+
+**Question.** A wrong domain declaration is a correctness bug, like a
+wrong `pure`. It permits reorderings the application can't tolerate. How
+can it be caught?
+
+**Considerations.**
+- Differential testing: run random linearizations of the partial order
+  against fakes, and check invariants the application states. For
+  example, "a receipt is never sent for a charge that failed".
+- Fault injection: fail effects in one domain and check that the effects
+  in other domains are still acceptable.
+- Static lint: flag an effect in a non-`main` domain that follows an
+  `await` of another domain's effect with no data dependency between
+  them. That is where the author may have meant an ordering.
+- The checks are only as good as the invariants the application states.
+  This may argue for a way to declare invariants alongside cells.
+
+**v0 default.** Only `main` is used in the example apps until there is a
+way to check domains.
+
+### 13.4 How far pushdown goes
+
+**Question.** §1.5 lets a caller pass unawaited handles, and makes
+projection (`.field`, `[i]`) on a handle lazy. Should it go further?
+
+- **Lazy `Ref[T]` parameters.** A callee declares a parameter as
+  `Ref[T]` and receives the handle itself. It can start before the
+  argument is ready, await it only on the paths that need it
+  (call-by-need), or pass it on without materializing it.
+- **Lazy ops.** Pure `@op`s applied to unawaited handles could produce
+  handles too, instead of requiring an `await`.
+
+**Considerations.**
+- Lazy parameters change a cell's signature, so strictness becomes part
+  of its interface. Vectorization has to handle arguments that are
+  resolved at different times.
+- A cell that awaits a `Ref` only on some paths gets data-dependent
+  arguments. Is that a guard in its graph, or a new kind of edge?
+- Lazy ops blur the line between eager and traced execution. Eager code
+  would build small graphs of ops on handles. That may be a good
+  thing (the eager and compiled models get closer), or a source of
+  confusion.
+- Errors in lazy values surface far from where they were created.
+  EXPLAIN ANALYZE needs to show where a failed value came from.
+
+**v0 default.** Handles may be passed as arguments and projected. Callees
+are strict, and ops require values.
