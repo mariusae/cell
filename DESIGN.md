@@ -611,13 +611,25 @@ graph. Defenses, in order:
    intercepted, and neither can `is` on values other than None, bools and
    Enum members (which are never tracers, see §5.2). Those are left to
    defenses 3, 5 and 6.
-3. **Calls from cell frames are checked.** During tracing, `sys.monitoring`
-   (PEP 669) watches calls made from traced frames: the cell body and any
-   plain helpers it calls. If a tracer is passed to anything that is not a
-   cell, an `@op`, an allowlisted builtin, or a traced helper, it's a
-   graph break. (To verify: exactly which call events and arguments are
-   visible. The fallback is a conservative break whenever an unknown
-   callable is invoked while any tracer is reachable from its arguments.)
+3. **What C code does is watched** (`monitor.py`). Code written in C can
+   bypass the tracer's dunders: `type(t)` and `id(t)` never ask the value,
+   and a C function that checks types directly raises `TypeError`, which
+   user code may catch. While a trace is active, `sys.monitoring`
+   (PEP 669) watches two events, in the traced body's task only:
+   - **CALL:** a C-level callable not known to be safe, called with a
+     traced value as its first argument, is a graph break. Python
+     functions are fine: the tracer sees through them. CALL only exposes
+     the callable and its first argument (for a method call, `self`), so
+     this check is partial.
+   - **EXCEPTION_HANDLED:** a `TypeError` caught anywhere in the body's
+     task is a graph break, since the tracer can't tell whether a traced
+     value caused it. This covers what CALL can't see, such as
+     `", ".join(names)` with traced names inside `try/except`.
+
+   Events caused by the tracer itself are ignored: the nearest caller
+   outside the standard library decides. Monitoring is process-wide while
+   any trace is active, but a call site in this package or asyncio is
+   disabled after its first event.
 4. **Guard budget.** If one trace records more than *N* guards (e.g.
    `sorted()` on a list of tracers, which guards on every comparison),
    break and report it. The fix is an `@op`.
@@ -631,12 +643,18 @@ graph. Defenses, in order:
 Defenses 1–4 make the tracer strict; 5 makes the system safe even when
 strictness has a hole.
 
-M1 implements defenses 1, 2 and 4. Until defense 3 exists, one hole is
-known: a tracer passed to library code that raises (for example
-`", ".join(names)` with traced names raises `TypeError`), where user code
-catches the error with `except Exception`, takes the except branch
-silently. `GraphBreak` itself is a `BaseException`, so `except Exception`
-never swallows a break.
+M1 implements defenses 1, 2 and 4, and M3 defenses 3 and 6. What remains
+open, and is left to lint and to validation (defense 5):
+
+- `is` on a traced value, other than against None, bools and Enum members
+  (lint: `identity`);
+- a C callable given a traced value in an argument after the first, which
+  doesn't raise `TypeError`;
+- a library catching an exception other than `TypeError` that a traced
+  value caused.
+
+`GraphBreak` itself is a `BaseException`, so `except Exception` never
+swallows a break.
 
 ### 5.5 Breaks during tracing
 
@@ -831,12 +849,26 @@ vmap pass needs anyway to split vectors (§10).
 
 ## 9. Static extraction and validation
 
-**Static extractor** (AST over the cell body and the helpers it reaches):
+**Static extractor** (`static.py`: AST over the cell body and the plain
+helpers it calls, with names resolved through the function's globals and
+closure):
 
-- produces the over-approximated **call graph**: every cell the body could
-  call, found through typed references,
-- produces **lint**: mutable global reads, direct I/O, clocks, randomness,
-  racing primitives, and values from calls passed to non-op functions,
+- produces the over-approximated **call graph**: every cell the body
+  refers to, called or not, found through typed references;
+- produces **lint** for composite cells. Leaf cells (those that call no
+  cells and use resources) implement I/O and aren't linted.
+  - *Errors* break the rules of §1.4: `nondeterminism` (clocks, random,
+    uuid, the environment), `io`, `mutable-global` (including closures),
+    `global-write`, `task` (spawning tasks), `race` (`asyncio.wait`,
+    `as_completed`, timeouts), `resource` (in a composite cell).
+  - *Warnings* are code the tracer will break on or specialize heavily,
+    found with a simple taint analysis (parameters, call results and ctx
+    sources are traced values): `format`, `convert`, `invisible`
+    (`type`, `id`, `callable`), `range` (a data-dependent loop),
+    `identity`, `ordering` (sorting traced values), `opaque-call` (a traced
+    value passed to library code), `ctx-escape`, `catch-all` (catching
+    `BaseException` catches graph breaks), and `print`;
+- runs as `python -m cell.static MODULE...`, exiting non-zero on errors;
 - is used for the safety checks in NOTES (capabilities, legality of
   policies). It is never used for optimization.
 
@@ -966,6 +998,19 @@ M2 is implemented in `src/cell/compiled.py` (the executor), the runtime
 `tests/test_random_programs.py` generates 60 programs from a small
 grammar (§9), traces each on several inputs, and runs every graph on
 every input, plus a deopt forced at each node, against eager execution.
+
+M3 is implemented in `src/cell/static.py` and `src/cell/monitor.py`.
+
+- `tests/test_static.py`: lint finds exactly the violations seeded in
+  `tests/lint_cases.py` (each marked `# expect: <rule>` on its line), and
+  nothing in a clean cell; the examples lint clean apart from the one
+  data-dependent loop; and the static call graph includes every call any
+  trace records, over the example scenarios and the random programs.
+- `tests/test_monitor.py`: `type`, `callable`, and a caught `TypeError`
+  from `", ".join` take the wrong path when tracing without strictness,
+  and break (getting the eager result) with it; safe uses of traced
+  values (building lists, `sum`, `sorted`, …) don't break; eager work
+  running concurrently with a trace isn't affected.
 
 ---
 

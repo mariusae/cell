@@ -16,6 +16,7 @@ not defined (DESIGN §4.3): only their issue order is.
 """
 
 import asyncio
+import linecache
 import random
 from collections import Counter
 
@@ -183,7 +184,10 @@ def make(i: int):
     rng = random.Random(SEED + i)
     source = Generator(rng).program()
     namespace = dict(NAMESPACE, __name__=f"generated_{i}")
-    exec(compile(source, f"<generated {i}>", "exec"), namespace)
+    filename = f"<generated {i}>"
+    # Register the source, so inspect (and static extraction) can find it.
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    exec(compile(source, filename, "exec"), namespace)
     inputs = [(rng.randrange(20), rng.randrange(20)) for _ in range(INPUTS)]
     return source, namespace["prog"], inputs
 

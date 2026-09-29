@@ -23,6 +23,7 @@ each is a single call node in the graph (DESIGN §5.7).
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import os
 import sys
@@ -35,6 +36,7 @@ from .context import Ctx, Handle
 from .core import Cell, Op
 from .errors import CellError, DataError
 from .graph import BUILTINS, Const, Graph, Input, Node
+from .monitor import MONITOR
 from .runtime import Invocation, Run, Runtime, _Interrupt
 from .semantics import UNIQUE, Domain
 
@@ -64,15 +66,23 @@ async def trace(
     *,
     request_id: str | None = None,
     max_guards: int = DEFAULT_MAX_GUARDS,
+    strict: bool = True,
 ) -> Traced:
-    """Run a cell as a request, recording its graph."""
+    """Run a cell as a request, recording its graph.
+
+    `strict` watches the body with sys.monitoring for what the tracer's
+    hooks can't see (monitor.py, DESIGN §5.4 defense 3).
+    """
     if not isinstance(cell, Cell):
         raise TypeError(f"{cell!r} is not a cell")
     arguments = cell.bind(tuple(args), dict(kwargs or {}))
     data.check(arguments)
     request_id = request_id or runtime.new_request_id()
-    rec = Recorder(cell, max_guards)
-    inv = await runtime.root(cell, arguments, request_id, make_ctx=rec.make_ctx, body=rec.body)
+    rec = Recorder(cell, max_guards, strict)
+    try:
+        inv = await runtime.root(cell, arguments, request_id, make_ctx=rec.make_ctx, body=rec.body)
+    finally:
+        MONITOR.unregister(rec.monitored)
     rec.active = False
     if rec.broken or inv.interrupted:
         run = await runtime.execute(cell, (), arguments, request_id=request_id, replay=inv.journal)
@@ -281,7 +291,8 @@ def recorder_of(obj: Any) -> Recorder | None:
     if t is dict:
         obj = obj.values()
     elif hasattr(t, "__dataclass_fields__"):
-        obj = [getattr(obj, f) for f in t.__dataclass_fields__]
+        # getattr with a default: sys.monitoring may ask about a half-built instance.
+        obj = [getattr(obj, f, None) for f in t.__dataclass_fields__]
     elif not isinstance(obj, (tuple, list)):
         return None
     for x in obj:
@@ -332,8 +343,10 @@ class TracingCtx(Ctx):
 class Recorder:
     """Builds one graph while a body runs."""
 
-    def __init__(self, cell: Cell, max_guards: int = DEFAULT_MAX_GUARDS):
+    def __init__(self, cell: Cell, max_guards: int = DEFAULT_MAX_GUARDS, strict: bool = True):
         self.cell = cell
+        self.strict = strict
+        self.monitored: asyncio.Task[Any] | None = None
         self.graph = Graph(cell.id, cell.code_hash, [])
         self.inv: Invocation | None = None
         self.active = True
@@ -347,7 +360,10 @@ class Recorder:
         self._packs: dict[Any, int] = {}  # identical packs share a node
 
     def make_ctx(self, inv: Invocation) -> Ctx:
+        # Runs in the body's task, which is the one to monitor.
         self.inv = inv
+        if self.strict:
+            self.monitored = MONITOR.register(self)
         return TracingCtx(inv, self)
 
     async def body(self, ctx: Ctx, arguments: dict[str, Any]) -> Any:
