@@ -202,7 +202,7 @@ def _batch(s: Scenario, graph: Graph) -> dict[str, Any]:
 def _settings(body: dict[str, Any], requests: int = 400) -> sim.Settings:
     return sim.Settings(
         requests=max(1, min(int(body.get("requests", requests)), 5000)),
-        clients=max(1, min(int(body.get("clients", 8)), 256)),
+        clients=max(1, min(int(body.get("clients", 32)), 256)),
         capacity=max(1, min(int(body.get("capacity", 8)), 256)),
         median_ms=max(0.1, float(body.get("median_ms", 10.0))),
         sigma=max(0.0, min(float(body.get("sigma", 0.5)), 3.0)),

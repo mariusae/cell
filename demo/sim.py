@@ -32,7 +32,7 @@ from examples.harness import BATCH_COST, NOW, Scenario, World
 @dataclass
 class Settings:
     requests: int = 400
-    clients: int = 8
+    clients: int = 32
     capacity: int = 8  # concurrent calls per service
     median_ms: float = 10.0
     sigma: float = 0.5  # spread of the log-normal: 0 is constant latency

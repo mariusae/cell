@@ -185,7 +185,7 @@ function select(name) {
         traced graph compiled as is, the graph with the rewrites (and caching) selected above, and that graph with batching:
         requests arriving within the batch window run together and share vector calls. Batching pays off under
         contention: with no more clients than a service has slots, nothing queues, so fewer calls save nothing, and
-        batching costs its window (and a vector call's per-element cost). Try more clients than capacity.</p>
+        batching costs its window (and a vector call's per-element cost). The default, 32 clients against 8 slots per service, is contended.</p>
       <div class="controls" style="position:static;margin:0;padding:8px 0;border:0">
         <label>median latency (ms) <input type="number" id="sim-median" value="10" min="0.1" step="0.1"></label>
         <label>tail (σ) <input type="number" id="sim-sigma" value="0.5" min="0" max="3" step="0.1"></label>
@@ -197,7 +197,7 @@ function select(name) {
       <div class="controls" style="position:static;margin:0;padding:0 0 8px;border:0">
         <span class="muted">Closed loop:</span>
         <label>requests <input type="number" id="sim-requests" value="400" min="1" max="5000"></label>
-        <label>clients <input type="number" id="sim-clients" value="8" min="1" max="256"></label>
+        <label>clients <input type="number" id="sim-clients" value="32" min="1" max="256"></label>
         <button id="simulate-btn">Simulate</button>
       </div>
       <div id="sim-out"></div>
