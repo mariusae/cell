@@ -1,0 +1,146 @@
+"""Cells and ops: the units users write (DESIGN §1.1, §1.3)."""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import inspect
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, overload
+
+from .errors import ContextError
+from .semantics import MAIN, Domain, Semantics, check_domain, external
+
+if TYPE_CHECKING:
+    from .context import Handle
+
+_ALLOWED_KINDS = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+
+
+class Cell:
+    """An async function whose calls go through a ctx.
+
+    Calling a cell issues the call immediately and returns a Handle
+    (DESIGN §1.4, rule 2). The cell object is its own typed reference.
+    """
+
+    def __init__(self, fn: Callable[..., Any], semantics: Semantics, domain: Domain | None):
+        if not inspect.iscoroutinefunction(fn):
+            raise TypeError(f"cell {fn.__qualname__} must be an async function")
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+        if not params or params[0].kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            raise TypeError(f"cell {fn.__qualname__} must take ctx as its first parameter")
+        for p in params[1:]:
+            if p.kind not in _ALLOWED_KINDS:
+                raise TypeError(
+                    f"cell {fn.__qualname__}: parameter {p.name!r} must be a regular or "
+                    "keyword-only parameter (no *args, **kwargs or positional-only)"
+                )
+        self.fn = fn
+        self.semantics = semantics
+        self.domain = domain
+        self.id = f"{fn.__module__}.{fn.__qualname__}"
+        self._sig = sig
+        self._ctx_param = params[0].name
+        functools.update_wrapper(self, fn)
+
+    @property
+    def effectful(self) -> bool:
+        return not self.semantics.pure
+
+    @functools.cached_property
+    def code_hash(self) -> str:
+        return _code_hash(self.fn)
+
+    def bind(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Bind call arguments to parameter names, with defaults applied."""
+        try:
+            bound = self._sig.bind(None, *args, **kwargs)
+        except TypeError as e:
+            raise TypeError(f"{self.id}: {e}") from None
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        del arguments[self._ctx_param]
+        return arguments
+
+    def __call__(self, ctx: Any, *args: Any, **kwargs: Any) -> Handle[Any]:
+        from .context import Ctx
+
+        if not isinstance(ctx, Ctx):
+            raise ContextError(f"{self.id} must be called with a ctx as its first argument")
+        return ctx._call(self, self.bind(args, kwargs))
+
+    def __repr__(self) -> str:
+        return f"<cell {self.id} {self.semantics!r}>"
+
+
+@overload
+def cell(fn: Callable[..., Any], /) -> Cell: ...
+@overload
+def cell(semantics: Semantics | None = None, /, *, domain: Domain | None = None) -> Callable[[Callable[..., Any]], Cell]: ...
+
+
+def cell(arg: Any = None, /, *, domain: Domain | None = None) -> Any:
+    """Declare a cell.
+
+        @cell                                  # external: unknown effects
+        @cell(pure)
+        @cell(effects("prefs"))
+        @cell(effects("audit"), domain="audit")
+    """
+
+    def make(fn: Callable[..., Any], semantics: Semantics) -> Cell:
+        if semantics.pure:
+            if domain is not None:
+                raise ValueError(f"pure cell {fn.__qualname__} cannot have an effect domain")
+            return Cell(fn, semantics, None)
+        return Cell(fn, semantics, MAIN if domain is None else check_domain(domain))
+
+    if callable(arg):
+        return make(arg, external)
+    if arg is not None and not isinstance(arg, Semantics):
+        raise TypeError(f"@cell takes semantics such as pure or effects(...), not {arg!r}")
+    semantics = external if arg is None else arg
+    return lambda fn: make(fn, semantics)
+
+
+class Op:
+    """A pure, synchronous, deterministic local function (DESIGN §1.3).
+
+    In eager mode an op is just a function call. The tracer records it as
+    one node and runs it on concrete values.
+    """
+
+    def __init__(self, fn: Callable[..., Any]):
+        if inspect.iscoroutinefunction(fn):
+            raise TypeError(f"op {fn.__qualname__} must be synchronous")
+        self.fn = fn
+        self.id = f"{fn.__module__}.{fn.__qualname__}"
+        functools.update_wrapper(self, fn)
+
+    @functools.cached_property
+    def code_hash(self) -> str:
+        return _code_hash(self.fn)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.fn(*args, **kwargs)
+
+    def __repr__(self) -> str:
+        return f"<op {self.id}>"
+
+
+def op(fn: Callable[..., Any]) -> Op:
+    """Declare an op."""
+    return Op(fn)
+
+
+def _code_hash(fn: Callable[..., Any]) -> str:
+    try:
+        source = inspect.getsource(fn).encode()
+    except (OSError, TypeError):
+        source = fn.__code__.co_code
+    return hashlib.sha256(source).hexdigest()[:16]

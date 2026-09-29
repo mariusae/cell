@@ -120,6 +120,19 @@ These rules already follow from NOTES §4. The tracer depends on them.
 4. **No racing in user code.** `asyncio.wait(FIRST_COMPLETED)` and
    `as_completed` are nondeterministic. If a race is needed later, it will
    be a ctx primitive (`ctx.race`) whose outcome is journaled.
+5. **Calls and sources come from the body's own task.** If a body spawned
+   tasks that each issued calls, the order of issues would depend on
+   scheduling, and `seq` numbers would not be deterministic. The runtime
+   rejects calls made from any other task. Concurrency comes from issuing
+   calls and awaiting their handles, which never needs another task.
+   `asyncio.gather` over handles is fine.
+
+**Leaf cells and I/O.** Leaf cells implement the I/O boundary: clients,
+databases, fakes. They get live objects from `ctx.resource(key)`, which is
+provided by the runtime and not journaled. A composite cell must not use
+resources, or it is no longer deterministic. Replay never runs a leaf
+whose call is journaled, so leaves don't need to be deterministic
+themselves.
 
 Plain helpers, sync or async, that take ctx and call cells are fine. The
 tracer sees through them. **Cell boundaries mark where policy applies,
@@ -839,6 +852,24 @@ so the benefit of each idea can be measured locally.
    ordering, control edges, and deopt correctness in the presence of
    effects. Later, sagas.
 
+**Status.** M0 is implemented in `src/cell`. The example programs are in
+`examples/`: the three applications above, plus `features.py`, a set of
+small programs that each pin down one rule of §1. Each program comes
+with scenarios: inputs, an initial fake world, and the expected result,
+error and effects. `tests/test_examples.py` checks every scenario three
+ways:
+
+- **eager:** the expected result and effects;
+- **full replay:** replaying the journal on a fresh world reproduces the
+  run without executing any leaf call;
+- **interrupt and replay:** interrupting the body before each `seq` and
+  replaying from the partial journal gives the same outcome, with every
+  leaf call and effect happening exactly once. This is the deopt path of
+  §6.3, exercised at every position.
+
+Later milestones add checks to the same scenarios, for example that
+compiled execution matches eager.
+
 ---
 
 ## 12. Open questions
@@ -906,6 +937,9 @@ issued so far, in all domains, before any later effect is issued.
 
 **v0 default.** No fence. Revisit when the example apps need one.
 
+If acquire/release orderings are adopted (§13.5), a fence is an
+`acq_rel` effect that does nothing, and this point is resolved.
+
 ### 13.3 Checking that a domain declaration is correct
 
 **Question.** A wrong domain declaration is a correctness bug, like a
@@ -924,8 +958,10 @@ can it be caught?
 - The checks are only as good as the invariants the application states.
   This may argue for a way to declare invariants alongside cells.
 
-**v0 default.** Only `main` is used in the example apps until there is a
-way to check domains.
+**v0 default.** Domains are declared and recorded (the `checkout`
+example uses them), but nothing reorders effects yet: the eager runtime
+runs them in program order, which is always allowed. Reordering across
+domains waits until there is a way to check the declarations.
 
 ### 13.4 How far pushdown goes
 
@@ -954,3 +990,61 @@ projection (`.field`, `[i]`) on a handle lazy. Should it go further?
 
 **v0 default.** Handles may be passed as arguments and projected. Callees
 are strict, and ops require values.
+
+### 13.5 Acquire/release orderings
+
+**Question.** Should effects carry a memory-model-style *ordering* in
+addition to a domain? Domains are all-or-nothing: effects in the same
+domain are fully ordered, and effects in different domains are not
+ordered. Many real cases need ordering in one direction only.
+
+**Proposal.** Each effect has an ordering: `relaxed` (the default),
+`acquire`, `release` or `acq_rel`.
+
+- **Within a domain:** program order, as in §4.4.
+- **Across domains:** for effects E1 before E2 in program order, there is
+  an effect edge E1 → E2 if E1 is `acquire` or E2 is `release`, and none
+  otherwise.
+
+So a **release** effect waits for every earlier effect, in every domain,
+to complete successfully; later effects may still move ahead of it. An
+**acquire** effect makes every later effect wait for it; earlier effects
+may still move past it. `main` behaves as if its effects were `acq_rel`
+with respect to each other.
+
+```python
+@cell(effects("locks"), order=ACQUIRE)
+async def lock(ctx, key: str) -> Lease: ...
+
+@cell(effects("email"), domain=UNIQUE, order=RELEASE)
+async def notify(ctx, receipt: Receipt) -> None: ...
+```
+
+With `notify` as a release, a receipt is sent only after everything
+before it succeeded, including the audit write in another domain. That
+is the "reply to the client" or "commit" point. With `lock` as an
+acquire, nothing after it runs before the lock is held, but an earlier
+audit write may still move past it.
+
+**Considerations.**
+- Cross-domain edges wait for the earlier effect to *complete and
+  succeed*. So a failed acquire blocks everything after it, and a release
+  is blocked by any earlier failure. Path edges are unchanged.
+- It makes domains easier to use safely (§13.3). An author can keep most
+  effects relaxed and mark the few points that must see everything before
+  them as releases, which is a smaller claim than "these domains are
+  independent".
+- It resolves the fence question (§13.2): a fence is an `acq_rel` no-op.
+- Where it is declared: a default on the cell (`order=`), which a call
+  site can override (`with ctx.order(RELEASE):`), like domains.
+- **Across requests (later).** In memory models, acquire and release
+  mainly synchronize *between* threads, by pairing on a location. The
+  analogue is ordering across requests through storage cells: a release
+  write returns a token, and an acquire read that presents the token sees
+  everything before the release. That is causal consistency, and it
+  connects to snapshot reads and isolation (NOTES §6–7). v0 would only
+  order effects within one invocation.
+
+**v0 default.** Not implemented. Nothing depends on it yet: the eager
+runtime runs effects in program order, which satisfies every ordering.
+
