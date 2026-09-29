@@ -183,6 +183,13 @@ def _format_node(g: Graph, n: Node) -> tuple[str, str, str]:
     tags: list[str] = []
     if n.kind == "param":
         body = f"param {a['name']}"
+    elif n.kind == "call" and a["cell"].startswith("cell.mapping.map_") and isinstance(n.inputs[0], Const):
+        # ctx.map: inputs are the target, its code, the mapped parameter, the items, the fixed arguments.
+        target, param, items, fixed = n.inputs[0].value, n.inputs[2].value, n.inputs[3], n.inputs[4]  # type: ignore[union-attr]
+        rest = "" if isinstance(fixed, Const) and not fixed.value else f", {_ref(fixed)}"
+        body = f"map {_short(target)}({param} in {_ref(items)}{rest})"
+        tags.append(f"effectful[{a['domain']}]" if a["effectful"] else "pure")
+        tags.append("seq=" + ".".join(str(s) for s in (*n.scope, a["seq"])))
     elif n.kind in ("call", "enter"):
         body = f"{n.kind} {_short(a['cell'])}({args})"
         tags.append(f"effectful[{a['domain']}]" if a["effectful"] else "pure")

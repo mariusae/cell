@@ -1,12 +1,12 @@
 graph feed #da391f8e (uid, k)
   %0 = param uid
   %1 = param k
-  %2 = source now()                  seq=0        examples/feed.py:75
-  %3 = call following(%0)            pure  seq=1  examples/feed.py:76
-  %4 = op len(%3)                                 examples/feed.py:77
-  %5 = guard %4 == 0                              examples/feed.py:77
-  %6 = op top_k((), %1)                           examples/feed.py:81
-  %7 = op truth(%6)                               examples/feed.py:82
-  %8 = guard %7 == False                          examples/feed.py:82
+  %2 = source now()                  seq=0        examples/feed.py:99
+  %3 = call following(%0)            pure  seq=1  examples/feed.py:100
+  %4 = op len(%3)                                 examples/feed.py:101
+  %5 = guard %4 == 0                              examples/feed.py:101
+  %6 = op top_k((), %1)                           examples/feed.py:105
+  %7 = op truth(%6)                               examples/feed.py:106
+  %8 = guard %7 == False                          examples/feed.py:106
   %9 = pack Feed(user=%0, posts=%6)
   return %9

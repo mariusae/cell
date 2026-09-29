@@ -233,6 +233,7 @@ class _Function:
         tree = ast.parse(textwrap.dedent("".join(lines)))
         node = tree.body[0]
         assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        node.decorator_list = []  # decorators run at definition, not in the body
         self.node = node
         self.locals = self._locals(node)
         self.tainted = self._taint(node)
@@ -385,6 +386,16 @@ class _Function:
     def _call(self, n: ast.Call) -> None:
         if isinstance(n.func, ast.Attribute) and n.func.attr == "create_task":
             self.report(n, "task", "error", "spawns a task; issue calls from the body and await their handles")
+            return
+        if self._ctx_attr(n.func) == "map" and n.args:
+            # ctx.map(cell, items, ...) is a call to a map cell, which calls cell.
+            from .mapping import map_effectful, map_pure
+
+            ok, target = self.resolve(n.args[0])
+            if not ok or not isinstance(target, Cell):
+                self.ex.calls |= {map_pure, map_effectful}  # can't tell which
+            else:
+                self.ex.calls.add(map_effectful if target.effectful else map_pure)
             return
         ok, fn = self.resolve(n.func)
         if not ok or isinstance(fn, (Cell, Op)):

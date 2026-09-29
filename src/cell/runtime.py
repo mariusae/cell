@@ -25,7 +25,7 @@ from . import data
 from .context import Ctx, Handle
 from .core import Cell
 from .errors import ContextError, DataError, DeterminismError
-from .compiled import Plan, compile_graph, run_plan
+from .compiled import Deopt, Plan, compile_graph, run_batch, run_plan
 from .graph import Graph
 from .journal import Entry, Err, Journal, Ok, Outcome
 from .semantics import Domain, check_domain
@@ -199,8 +199,25 @@ class Runtime:
         self._ttls: dict[str, float] = {}
         self._cache: dict[tuple[str, str, str], tuple[Any, float]] = {}
         self.cache_stats: Counter[str] = Counter()
+        self.vector_stats: Counter[str] = Counter()  # vector calls, elements, fallbacks
+        self.batch_stats: Counter[str] = Counter()  # batches, requests
+        self._batching: dict[str, tuple[int, float]] = {}
+        self._batchers: dict[tuple[str, int], _Batcher] = {}
         for c, ttl in (cache or {}).items():
             self.cache(c, ttl)
+
+    def batch(self, cell: Cell, *, max_size: int = 64, window: float = 0.002) -> None:
+        """Run requests for a cell in batches (DESIGN §10, NOTES §11).
+
+        A request waits up to `window` seconds for others to join it, or
+        until `max_size` have arrived; then they run together through the
+        cell's installed graph, and share its vector calls. Requests run
+        one by one if the cell has no installed graph.
+        """
+        self._batching[cell.id] = (max_size, window)
+
+    def caches(self, cell: Cell) -> bool:
+        return cell.id in self._ttls
 
     def cache(self, cell: Cell, ttl: float) -> None:
         """Cache the results of calls to a pure cell for `ttl` seconds (NOTES §2).
@@ -268,8 +285,61 @@ class Runtime:
         data.check(arguments)
         if request_id is None:
             request_id = replay.request_id if replay is not None else self.new_request_id()
+        if cell.id in self._batching and replay is None and interrupt_at is None and self.plan(cell) is not None:
+            return await self._batcher(cell).submit(arguments, request_id)
         inv = await self.root(cell, arguments, request_id, replay=replay, interrupt_at=interrupt_at)
         return self.run_of(inv)
+
+    async def execute_batch(
+        self, cell: Cell, requests: list[tuple[tuple[Any, ...], Mapping[str, Any], str | None]]
+    ) -> list[Run]:
+        """Run requests (args, kwargs, request id) together through the cell's installed graph.
+
+        Each request runs in its own lane, with its own journal, and deopts
+        on its own; the lanes share vector calls. Without an installed graph,
+        the requests run concurrently, each on its own.
+        """
+        items = []
+        for args, kwargs, request_id in requests:
+            arguments = cell.bind(tuple(args), dict(kwargs or {}))
+            data.check(arguments)
+            items.append((arguments, request_id or self.new_request_id()))
+        return await self._execute_batch(cell, items)
+
+    async def _execute_batch(self, cell: Cell, items: list[tuple[dict[str, Any], str]]) -> list[Run]:
+        plan = self.plan(cell)
+        if plan is None:
+            invs = await asyncio.gather(*(self.root(cell, a, r) for a, r in items))
+            return [self.run_of(inv) for inv in invs]
+        self.batch_stats["batches"] += 1
+        self.batch_stats["requests"] += len(items)
+        invs = await asyncio.create_task(self._invoke_batch(plan, cell, items))
+        return [self.run_of(inv) for inv in invs]
+
+    async def _invoke_batch(self, plan: Plan, cell: Cell, items: list[tuple[dict[str, Any], str]]) -> list[Invocation]:
+        invs = []
+        for arguments, request_id in items:
+            inv = Invocation(self, cell, arguments, (), request_id, None, None)
+            inv.task = asyncio.current_task()
+            inv.journal.mode = "compiled"
+            invs.append(inv)
+        results = await run_batch(plan, invs, [a for a, _ in items])
+        # Lanes that deopted replay concurrently, each in its own task.
+        finals = await asyncio.gather(
+            *(
+                self._finish(inv, result, plan, cell, arguments, (), request_id, None)
+                for inv, result, (arguments, request_id) in zip(invs, results, items)
+            )
+        )
+        return list(finals)
+
+    def _batcher(self, cell: Cell) -> _Batcher:
+        loop = asyncio.get_running_loop()
+        key = (cell.id, id(loop))
+        if key not in self._batchers:
+            max_size, window = self._batching[cell.id]
+            self._batchers[key] = _Batcher(self, cell, max_size, window)
+        return self._batchers[key]
 
     def new_request_id(self) -> str:
         return f"r{next(self._request_ids)}"
@@ -332,6 +402,19 @@ class Runtime:
         inv.task = asyncio.current_task()
         inv.journal.mode = "compiled"
         result = await run_plan(plan, inv, arguments)
+        return await self._finish(inv, result, plan, cell, arguments, path, request_id, replay)
+
+    async def _finish(
+        self,
+        inv: Invocation,
+        result: Ok | Deopt,
+        plan: Plan,
+        cell: Cell,
+        arguments: dict[str, Any],
+        path: tuple[int, ...],
+        request_id: str,
+        replay: Journal | None,
+    ) -> Invocation:
         inv.finished = True
         if isinstance(result, Ok):
             inv.journal.entries.sort(key=lambda e: e.seq)
@@ -340,7 +423,7 @@ class Runtime:
         # Deopt (DESIGN §6.3): replay eagerly from what the compiled attempt
         # issued, including calls still in flight, which replay waits for.
         merged = inv.journal.merged_over(replay)
-        eager = await self._invoke(cell, arguments, path, request_id, merged, compiled=False)
+        eager = await asyncio.create_task(self._invoke(cell, arguments, path, request_id, merged, compiled=False))
         if inv.children:
             await asyncio.gather(*(h._task for h in inv.children), return_exceptions=True)
         eager.journal.mode = "deopt"
@@ -425,6 +508,7 @@ class Runtime:
             entry.replayed = True
             entry.started = hit.started
             entry.cached = hit.cached
+            entry.batched = hit.batched
             entry.child = hit.child
             if hit.outcome is not None:
                 return hit.outcome
@@ -489,6 +573,48 @@ async def _resolve_handles(arguments: dict[str, Any]) -> dict[str, Any]:
     # not count as awaiting it.
     values = [await leaf._task if isinstance(leaf, Handle) else leaf for leaf in leaves]
     return data.unflatten(tree, values)
+
+
+class _Batcher:
+    """Collects requests for one cell into batches (Runtime.batch)."""
+
+    def __init__(self, runtime: Runtime, cell: Cell, max_size: int, window: float):
+        self.runtime = runtime
+        self.cell = cell
+        self.max_size = max_size
+        self.window = window
+        self.pending: list[tuple[dict[str, Any], str, asyncio.Future[Run]]] = []
+        self.timer: asyncio.TimerHandle | None = None
+
+    async def submit(self, arguments: dict[str, Any], request_id: str) -> Run:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Run] = loop.create_future()
+        self.pending.append((arguments, request_id, future))
+        if len(self.pending) >= self.max_size:
+            self._flush()
+        elif self.timer is None:
+            self.timer = loop.call_later(self.window, self._flush)
+        return await future
+
+    def _flush(self) -> None:
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+        batch, self.pending = self.pending, []
+        if batch:
+            asyncio.get_running_loop().create_task(self._run(batch))
+
+    async def _run(self, batch: list[tuple[dict[str, Any], str, asyncio.Future[Run]]]) -> None:
+        try:
+            runs = await self.runtime._execute_batch(self.cell, [(a, r) for a, r, _ in batch])
+        except BaseException as e:
+            for _, _, future in batch:
+                if not future.done():
+                    future.set_exception(e)
+            raise
+        for (_, _, future), run in zip(batch, runs):
+            if not future.done():
+                future.set_result(run)
 
 
 @dataclass(frozen=True)

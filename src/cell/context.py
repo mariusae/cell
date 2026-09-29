@@ -96,6 +96,14 @@ class Ctx:
         finally:
             self._inv.pop_domain()
 
+    def map(self, cell: Cell, items: Any, /, **fixed: Any) -> Handle[list[Any]]:
+        """Call `cell` once per item, binding each to its first parameter not
+        given in `fixed`. One call, however many items: see mapping.py."""
+        from .mapping import map_call
+
+        mapper, arguments = map_call(cell, items, fixed)
+        return self._call(mapper, arguments)
+
     def _call(self, cell: Cell, arguments: dict[str, Any]) -> Handle[Any]:
         return self._inv.call(cell, arguments)
 

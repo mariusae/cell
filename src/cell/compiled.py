@@ -25,6 +25,17 @@ runtime replays the invocation eagerly from its journal (DESIGN §6.3).
 Errors therefore always come from eager execution, which is what defines
 them. A compiled run succeeds only if every node ran and every call it
 issued completed successfully.
+
+Batches (milestone M5). A run is a batch of *lanes*, one per request, all
+running the same plan; a single request is a batch of one. Each lane keeps
+its own state, invocation and journal, and deopts on its own: a guard that
+fails in one lane partitions it out, and the rest go on. What lanes share
+is vector calls. A pure call to a cell with a vector form (DESIGN §10), or
+a ctx.map over one, is not issued when it's ready: it waits until every
+lane still running has reached it, and then all such calls to the same
+cell, across nodes and lanes, go out as one vector call. The results are
+split back, and each lane journals its own call, marked `batched`. If the
+vector call fails, the calls go out one by one, so errors are attributed.
 """
 
 from __future__ import annotations
@@ -35,13 +46,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from . import data
+from .context import Handle
 from .core import Cell, Op, find_cell, find_op
 from .errors import CellError
 from .graph import BUILTINS, Const, Graph, Input, Node
 from .journal import Entry, Ok
+from .mapping import MAP_CELLS, map_target
 
 if TYPE_CHECKING:
-    from .context import Handle
     from .runtime import Invocation
 
 
@@ -90,19 +102,30 @@ def compile_graph(graph: Graph) -> Plan:
 
 async def run_plan(plan: Plan, inv: Invocation, arguments: dict[str, Any]) -> Ok | Deopt:
     """Run a plan as an invocation. The caller replays eagerly on Deopt."""
-    plan.runs += 1
-    run = _Run(plan, inv, arguments)
-    outcome = await run.run()
-    if isinstance(outcome, Deopt):
-        plan.deopts[outcome.reason] += 1
-    return outcome
+    return (await run_batch(plan, [inv], [arguments]))[0]
+
+
+async def run_batch(plan: Plan, invs: list[Invocation], arguments: list[dict[str, Any]]) -> list[Ok | Deopt]:
+    """Run a plan as a batch of invocations, one lane each. The caller replays each lane that deopts."""
+    batch = _Batch(plan, [_Run(plan, inv, args) for inv, args in zip(invs, arguments)])
+    outcomes = await batch.run()
+    for outcome in outcomes:
+        plan.runs += 1
+        if isinstance(outcome, Deopt):
+            plan.deopts[outcome.reason] += 1
+    return outcomes
 
 
 class _Run:
+    """One lane: a request running the plan."""
+
     def __init__(self, plan: Plan, inv: Invocation, arguments: dict[str, Any]):
         self.plan = plan
         self.inv = inv
         self.arguments = arguments
+        self.batch: _Batch | None = None
+        self.deferred: dict[int, dict[str, Any]] = {}  # node -> arguments, waiting for a vector call
+        self.vectored: set[int] = set()  # nodes whose calls are in flight in a vector call
         self.nodes = plan.graph.nodes
         self.done: set[int] = set()  # completed successfully
         self.values: dict[int, Any] = {}
@@ -116,37 +139,37 @@ class _Run:
         self.scopes: dict[tuple[int, ...], Invocation] = {(): inv}
         self.entries: dict[tuple[int, ...], Entry] = {}
 
-    async def run(self) -> Ok | Deopt:
-        try:
-            return await self._run()
-        finally:
-            for scope, sub in self.scopes.items():
-                if scope:
-                    # Calls inlined callees left in flight complete before the
-                    # invocation does, like the invocation's own.
-                    sub.finished = True
-                    self.inv.children.extend(sub.children)
+    @property
+    def finished(self) -> bool:
+        # Every call issued must complete, even if nothing uses its result:
+        # structured concurrency (DESIGN §1.4, rule 3).
+        return (
+            self.deopt is None
+            and self.result is not None
+            and not self.tasks
+            and not self.deferred
+            and not self.vectored
+            and len(self.started) == len(self.nodes)
+        )
 
-    async def _run(self) -> Ok | Deopt:
-        while True:
-            self._start_ready()
-            if self.deopt is not None:
-                return Deopt(self.deopt)
-            if not self.tasks:
-                if self.result is not None and len(self.started) == len(self.nodes):
-                    return self.result
-                return Deopt("stalled: nodes that can never start")
-            # Every call issued must complete, even if nothing uses its
-            # result: structured concurrency (DESIGN §1.4, rule 3).
-            finished, _ = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in finished:
-                nid = self.tasks.pop(task)
-                if task.cancelled():
-                    self._fail(f"%{nid} was cancelled")
-                elif (e := task.exception()) is not None:
-                    self._fail(f"%{nid} {_short(self.nodes[nid].attrs['cell'])} raised {type(e).__name__}")
-                else:
-                    self._complete(nid, task.result())
+    def close(self) -> None:
+        for scope, sub in self.scopes.items():
+            if scope:
+                # Calls inlined callees left in flight complete before the
+                # invocation does, like the invocation's own.
+                sub.finished = True
+                self.inv.children.extend(sub.children)
+
+    def task_done(self, task: asyncio.Task[Any]) -> None:
+        nid = self.tasks.pop(task)
+        if task.cancelled():
+            self._fail(f"%{nid} was cancelled")
+        elif (e := task.exception()) is not None:
+            self._fail(f"%{nid} {_short(self.nodes[nid].attrs['cell'])} raised {type(e).__name__}")
+        else:
+            # The dataflow consumed it: "awaited" in the journal's sense.
+            self.issued[nid]._entry.awaited = True
+            self._complete(nid, task.result())
 
     def _start_ready(self) -> None:
         progress = True
@@ -169,7 +192,8 @@ class _Run:
         if n.kind == "exit":
             # A callee completes only when everything it issued has.
             scope = n.scope
-            if any(self.nodes[t].scope[: len(scope)] == scope for t in self.tasks.values()):
+            pending = [*self.tasks.values(), *self.deferred, *self.vectored]
+            if any(self.nodes[t].scope[: len(scope)] == scope for t in pending):
                 return False
         for i in n.inputs:
             if isinstance(i, int) and i not in self.done:
@@ -245,6 +269,13 @@ class _Run:
                 arguments[param] = self.issued[i]  # pushdown: resolved before the callee starts
             else:
                 arguments[param] = self._value(i)
+        if self.batch is not None and self.batch.vector_of(self, n, arguments) is not None:
+            self.deferred[n.id] = arguments
+            return
+        self.issue(n, arguments)
+
+    def issue(self, n: Node, arguments: dict[str, Any]) -> None:
+        a = n.attrs
         inv = self.scopes[n.scope]
         handle = inv.call(self.plan.cells[n.id], arguments, seq=a["seq"], domain=a["domain"])
         self.issued[n.id] = handle
@@ -288,3 +319,155 @@ class _Run:
 
 def _short(cell_id: str) -> str:
     return cell_id.rsplit(".", 1)[-1]
+
+
+type _Element = tuple[_Run, int, dict[str, Any], str, int]  # lane, node, arguments, "call" or "map", count
+
+
+class _Batch:
+    """Runs lanes together, and sends their vector-capable calls as vector calls."""
+
+    def __init__(self, plan: Plan, lanes: list[_Run]):
+        self.plan = plan
+        self.lanes = lanes
+        self.runtime = lanes[0].inv.runtime
+        for lane in lanes:
+            lane.batch = self
+        self.outcomes: dict[int, Ok | Deopt] = {}
+        self.vector_tasks: dict[asyncio.Task[Any], list[_Element]] = {}
+
+    def vector_of(self, lane: _Run, n: Node, arguments: dict[str, Any]) -> tuple[Cell, str] | None:
+        """The vector form a call can go out as, and how: as one element ("call"), or one per item ("map")."""
+        if n.kind != "call" or n.effectful:
+            return None
+        if lane.scopes[n.scope]._replay is not None:
+            return None  # replaying (validation): calls are answered from the journal
+        leaves, _ = data.flatten(arguments, is_leaf=lambda v: isinstance(v, Handle))
+        if any(isinstance(v, Handle) for v in leaves):
+            return None  # a handle still resolving: issue the call, and let it resolve
+        cell = self.plan.cells[n.id]
+        if cell.id in MAP_CELLS:
+            target = map_target(arguments)
+            if target is None or target.vector is None or self.runtime.caches(target):
+                return None
+            return target.vector, "map"
+        if cell.vector is None or self.runtime.caches(cell):
+            return None  # let the cache answer instead
+        return cell.vector, "call"
+
+    def _active(self) -> list[_Run]:
+        return [lane for i, lane in enumerate(self.lanes) if i not in self.outcomes]
+
+    async def run(self) -> list[Ok | Deopt]:
+        try:
+            while True:
+                for i, lane in enumerate(self.lanes):
+                    if i in self.outcomes:
+                        continue
+                    lane._start_ready()
+                    if lane.deopt is not None:
+                        self.outcomes[i] = Deopt(lane.deopt)
+                if self._flush():
+                    continue  # it completed nodes (maps over nothing): start what they unblock
+                for i, lane in enumerate(self.lanes):
+                    if i not in self.outcomes and lane.finished:
+                        assert lane.result is not None
+                        self.outcomes[i] = lane.result
+                active = self._active()
+                if not active:
+                    return [self.outcomes[i] for i in range(len(self.lanes))]
+                waiting = {t: lane for lane in active for t in lane.tasks}
+                if not waiting and not self.vector_tasks:
+                    for i in range(len(self.lanes)):
+                        self.outcomes.setdefault(i, Deopt("stalled: nodes that can never start"))
+                    continue
+                finished, _ = await asyncio.wait([*waiting, *self.vector_tasks], return_when=asyncio.FIRST_COMPLETED)
+                for task in finished:
+                    if task in self.vector_tasks:
+                        self._vector_done(task)
+                    elif task in waiting:
+                        waiting[task].task_done(task)
+        finally:
+            for lane in self.lanes:
+                lane.close()
+
+    def _flush(self) -> bool:
+        """Send the deferred calls every active lane has reached, grouped by vector cell.
+
+        Returns whether any completed right away.
+        """
+        completed = False
+        active = self._active()
+        groups: dict[str, tuple[Cell, list[_Element]]] = {}
+        for lane in active:
+            for nid, arguments in list(lane.deferred.items()):
+                if not all(nid in other.started for other in active):
+                    continue  # wait for the other lanes to get here
+                found = self.vector_of(lane, self.plan.graph.nodes[nid], arguments)
+                assert found is not None
+                vector, how = found
+                count = len(arguments["items"]) if how == "map" else 1
+                del lane.deferred[nid]
+                lane.vectored.add(nid)
+                groups.setdefault(vector.id, (vector, []))[1].append((lane, nid, arguments, how, count))
+        for vector, elements in groups.values():
+            n = sum(e[4] for e in elements)
+            if len(elements) == 1 and n > 0:
+                # Nothing to share: issue the call as it is. (A map still uses
+                # the vector form, inside the map cell.)
+                lane, nid, arguments, _, _ = elements[0]
+                lane.vectored.discard(nid)
+                lane.issue(self.plan.graph.nodes[nid], arguments)
+                continue
+            if n == 0:  # maps over nothing
+                for lane, nid, arguments, _, _ in elements:
+                    self._deliver(lane, nid, arguments, [])
+                completed = True
+                continue
+            columns: dict[str, list[Any]] = {p: [] for p in vector.params}
+            for _, _, arguments, how, count in elements:
+                for p in vector.params:
+                    if how == "call":
+                        columns[p].append(arguments[p])
+                    elif p == arguments["param"]:
+                        columns[p].extend(arguments["items"])
+                    else:
+                        columns[p].extend([arguments["fixed"][p]] * count)
+            self.runtime.vector_stats["calls"] += 1
+            self.runtime.vector_stats["elements"] += n
+            request_id = f"vector-{self.runtime.vector_stats['calls']}"
+            task = asyncio.create_task(self.runtime._invoke(vector, columns, (), request_id))
+            self.vector_tasks[task] = elements
+        return completed
+
+    def _vector_done(self, task: asyncio.Task[Any]) -> None:
+        elements = self.vector_tasks.pop(task)
+        outcome = task.result().journal.outcome
+        n = sum(e[4] for e in elements)
+        results = outcome.value if isinstance(outcome, Ok) else None
+        if not isinstance(results, (list, tuple)) or len(results) != n:
+            # Failed, or not one result per element: send the calls one by one.
+            self.runtime.vector_stats["fallbacks"] += 1
+            for lane, nid, arguments, _, _ in elements:
+                lane.vectored.discard(nid)
+                if lane.deopt is None:
+                    lane.issue(self.plan.graph.nodes[nid], arguments)
+            return
+        at = 0
+        for lane, nid, arguments, how, count in elements:
+            value = results[at] if how == "call" else list(results[at : at + count])
+            at += count
+            self._deliver(lane, nid, arguments, value)
+
+    def _deliver(self, lane: _Run, nid: int, arguments: dict[str, Any], value: Any) -> None:
+        lane.vectored.discard(nid)
+        if lane.deopt is not None:
+            return  # a pure result the lane no longer needs; replay recomputes it
+        n = self.plan.graph.nodes[nid]
+        entry = Entry(seq=n.attrs["seq"], kind="call", target=n.attrs["cell"], effectful=False)
+        entry.args = arguments
+        entry.args_digest = data.digest(arguments)
+        entry.started = entry.awaited = entry.batched = True
+        entry.outcome = Ok(value)
+        lane.scopes[n.scope].journal.entries.append(entry)
+        lane._complete(nid, value)

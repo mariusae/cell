@@ -71,6 +71,7 @@ class Entry:
     awaited: bool = False
     replayed: bool = False  # the outcome came from a journal, not execution
     cached: bool = False  # the outcome came from the runtime's cache (no child journal)
+    batched: bool = False  # the outcome came from a vector call shared with other calls (no child journal)
     child: Journal | None = None  # the callee's journal
     handle: Handle[Any] | None = field(default=None, repr=False)
 
@@ -181,6 +182,13 @@ class Journal:
 
 def _format_entry(e: Entry, indent: str) -> str:
     args = "…" if e.args is None else ", ".join(f"{k}={_short(v, 30)}" for k, v in e.args.items())
+    if e.args is not None and e.target.startswith("cell.mapping.map_"):
+        # ctx.map: show the cell mapped over, not the map cell's own arguments.
+        fixed = "".join(f", {k}={_short(v, 30)}" for k, v in e.args["fixed"].items())
+        args = f"{e.args['param']} in {_short(e.args['items'], 40)}{fixed}"
+        name = "map " + _name(e.args["cell"])
+    else:
+        name = _name(e.target) if e.kind == "call" else f"ctx.{e.target}"
     tags = []
     if e.effectful:
         tags.append(f"effectful[{e.domain}]")
@@ -188,13 +196,14 @@ def _format_entry(e: Entry, indent: str) -> str:
         tags.append("replayed")
     if e.cached:
         tags.append("cached")
+    if e.batched:
+        tags.append("batched")
     if e.kind == "call" and not e.awaited:
         tags.append("unawaited")
     if e.kind == "call" and not e.started and e.outcome is not None:
         tags.append("not started")
     tag = f"  ({', '.join(tags)})" if tags else ""
     outcome = "in flight" if e.outcome is None else repr(e.outcome)
-    name = _name(e.target) if e.kind == "call" else f"ctx.{e.target}"
     return f"{indent}#{e.seq} {name}({args}) -> {outcome}{tag}"
 
 

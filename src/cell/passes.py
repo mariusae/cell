@@ -156,18 +156,28 @@ def doomed(graph: Graph) -> set[tuple[int, ...]]:
     return {n.scope for n in graph.nodes if n.kind == "guard" and isinstance(n.inputs[0], Const) and n.scope}
 
 
-def optimize(graph: Graph, callees: Mapping[str, Graph] | None = None) -> Graph:
+def optimize(
+    graph: Graph,
+    callees: Mapping[str, Graph] | None = None,
+    *,
+    inlining: bool = True,
+    folding: bool = True,
+    dedupe: bool = True,
+) -> Graph:
     """The standard pipeline: inline composite callees, fold constants, share what's identical.
 
-    A callee inlined at a call site where one of its guards can never hold
-    would make every run deopt; such call sites are left as calls.
+    Each pass can be turned off. With folding, a callee inlined at a call
+    site where one of its guards can never hold would make every run
+    deopt; such call sites are left as calls.
     """
     exclude: set[tuple[int, ...]] = set()
     while True:
-        out = fold(inline(graph, callees or {}, exclude=exclude))
+        out = inline(graph, callees or {}, exclude=exclude) if inlining else graph
+        if folding:
+            out = fold(out)
         bad = {scope[:1] for scope in doomed(out)} - exclude
         if not bad:
-            return dedup(out)
+            return dedup(out) if dedupe else out
         exclude |= bad
 
 

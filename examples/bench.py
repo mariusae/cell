@@ -25,6 +25,9 @@ from .harness import Scenario, World
 DEFAULT_LATENCY = 0.010
 PROFILES: dict[str, dict[str, float]] = {
     "examples.home": {"get_items": 0.030},  # a slow candidate source
+    # Scoring features is the expensive service (model inference); marking
+    # posts seen is a cheap write.
+    "examples.feed": {"features": 0.030, "features_many": 0.030, "mark_seen": 0.005},
 }
 
 
@@ -32,17 +35,21 @@ def _profile(s: Scenario) -> dict[str, float]:
     return PROFILES.get(s.cell.fn.__module__, {})
 
 
+async def callee_graphs(s: Scenario, journal: Any) -> dict[str, Any]:
+    """Graphs for the composite cells a request called, traced from those calls."""
+    callees: dict[str, Any] = {}
+    cells = {c.id: c for c in call_graph([s.cell])}
+    for entry in journal.entries:
+        child = entry.child
+        if child is not None and child.cell in cells and any(e.kind == "call" for e in child.entries):
+            traced, _ = await Scenario(s.name, cells[child.cell], (), dict(child.args), s.tables).trace()
+            callees.setdefault(child.cell, traced.graph)
+    return callees
+
+
 def _graph(s: Scenario) -> Any:
     traced, _ = asyncio.run(s.trace())
-    callees = {}
-    # Composite callees get graphs traced from the calls this request made.
-    for entry in traced.run.journal.entries:
-        child = entry.child
-        if child is not None and any(e.kind == "call" for e in child.entries):
-            cell = next(c for c in call_graph([s.cell]) if c.id == child.cell)
-            callee_traced, _ = asyncio.run(Scenario(s.name, cell, (), dict(child.args), s.tables).trace())
-            callees.setdefault(cell.id, callee_traced.graph)
-    return optimize(traced.graph, callees)
+    return optimize(traced.graph, asyncio.run(callee_graphs(s, traced.run.journal)))
 
 
 def _latency(s: Scenario, graph: Any = None, cache: bool = False) -> tuple[str, float]:

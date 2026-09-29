@@ -64,6 +64,16 @@ async def log(ctx, v: int) -> None:
     w.effect(ctx, "log", v=v)
 
 
+@get.vectorized
+async def get_many(ctx, k: list[int]) -> list[int]:
+    # One call for many keys; it fails as a whole if any key fails, and the
+    # runtime then sends the calls one by one to attribute the error.
+    await ctx.resource(World).enter(ctx, "get_many", len(k))
+    if any(x % 11 == 10 for x in k):
+        raise Boom(k)
+    return [(x * 7 + 3) % 23 for x in k]
+
+
 @op
 def mix(a: int, b: int) -> int:
     return (a * 31 + b) % 97
@@ -230,9 +240,13 @@ def check(prog, graph, args, source, fail_at=None):
     r = run(rt.execute(prog, args, request_id="r"))
     context = f"\n{source}\nargs={args} fail_at={fail_at}\n{graph.format()}\n{r.journal.format()}"
     assert outcome_digest(r.outcome) == outcome_digest(expected.outcome), context
-    assert r.journal.summary() == expected.journal.summary(), context
+    assert r.journal.effects() == expected.journal.effects(), context
+    if not any(e.batched for j in r.journal.walk() for e in j.entries):
+        # Without vector calls, the journal matches call for call, and every
+        # leaf call eager makes happens (compiled may speculate more).
+        assert r.journal.summary() == expected.journal.summary(), context
+        assert not Counter(ew.calls) - Counter(w.calls), context
     assert_effects_match(r, expected, w, ew, context)
-    assert not Counter(ew.calls) - Counter(w.calls), context
     return r
 
 

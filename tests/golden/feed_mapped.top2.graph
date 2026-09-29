@@ -1,0 +1,17 @@
+graph feed_mapped #6e464917 (uid, k)
+  %0 = param uid
+  %1 = param k
+  %2 = source now()                    seq=0                               examples/feed.py:129
+  %3 = call following(%0)              pure  seq=1                         examples/feed.py:130
+  %4 = map recent_posts(author in %3)  pure  seq=2                         examples/feed.py:131
+  %5 = op concat(%4)                                                       examples/feed.py:132
+  %6 = pack {'uid': %0}                                                    examples/feed.py:133
+  %7 = map features(post in %5, %6)    pure  seq=3                         examples/feed.py:133
+  %8 = op score_all(%5, %7, %2)                                            examples/feed.py:134
+  %9 = op top_k(%8, %1)                                                    examples/feed.py:134
+  %10 = op truth(%9)                                                       examples/feed.py:135
+  %11 = guard %10 == True                                                  examples/feed.py:135
+  %12 = op post_ids(%9)                                                    examples/feed.py:136
+  %13 = call mark_seen(%0, %12)        effectful[main]  seq=4  path=[%11]  examples/feed.py:136
+  %14 = pack Feed(user=%0, posts=%9)
+  return %14

@@ -50,10 +50,14 @@ def compiled_run(graph: Graph, s: Scenario, fail_at: int | None = None):
 def assert_matches_eager(s: Scenario, r, world) -> None:
     eager, eager_world = run(s.run())
     assert outcome_digest(r.outcome) == outcome_digest(eager.outcome), r.journal.format()
-    assert r.journal.summary() == eager.journal.summary(), r.journal.format()
+    # Pure calls may be speculated, or fused into vector calls (M5), so
+    # compare what matters outside: the outcome and effectful calls (§2).
+    assert r.journal.effects() == eager.journal.effects(), r.journal.format()
+    if not any(e.batched for j in r.journal.walk() for e in j.entries):
+        assert r.journal.summary() == eager.journal.summary(), r.journal.format()
+        # Every call eager makes happens; compiled may add speculative pure calls.
+        assert not Counter(eager_world.calls) - Counter(world.calls)
     assert Counter(e.key() for e in world.effects) == Counter(e.key() for e in eager_world.effects)
-    # Every call eager makes happens; compiled may add speculative pure calls.
-    assert not Counter(eager_world.calls) - Counter(world.calls)
     assert r.unconsumed == ()
 
 

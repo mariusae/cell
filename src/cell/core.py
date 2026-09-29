@@ -60,6 +60,8 @@ class Cell:
         self.fn = fn
         self.semantics = semantics
         self.domain = domain
+        self.vector: Cell | None = None  # a batched implementation (DESIGN §10)
+        self.scalar: Cell | None = None  # for a vector form: the cell it batches
         self.id = f"{fn.__module__}.{fn.__qualname__}"
         self._sig = sig
         self._ctx_param = params[0].name
@@ -69,6 +71,30 @@ class Cell:
     @property
     def effectful(self) -> bool:
         return not self.semantics.pure
+
+    @property
+    def params(self) -> list[str]:
+        """Parameter names, excluding ctx."""
+        return [p for p in self._sig.parameters if p != self._ctx_param]
+
+    def vectorized(self, fn: Callable[..., Any]) -> Cell:
+        """Declare a vector form: the same parameters, each a list, returning a list.
+
+            @features.vectorized
+            async def features_batch(ctx, uid: list[int], post: list[Post]) -> list[Features]: ...
+
+        It must compute, element by element, what the cell computes:
+        `vector(xs)[i] == cell(xs[i])`. Only pure cells may have one, since
+        a vector call replaces many calls with one.
+        """
+        if self.effectful:
+            raise ValueError(f"{self.id} is {self.semantics!r}; only pure cells can have vector forms")
+        vector = Cell(fn, self.semantics, None)
+        if vector.params != self.params:
+            raise TypeError(f"vector form {vector.id} must take the parameters of {self.id}: {self.params}")
+        self.vector = vector
+        vector.scalar = self
+        return vector
 
     @functools.cached_property
     def returns_none(self) -> bool:

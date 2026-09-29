@@ -24,6 +24,9 @@ from cell.trace import Traced, trace
 NOW = 1_000_000.0
 """The fixed clock scenarios run with."""
 
+BATCH_COST = 0.01
+"""A vector call of n elements costs (1 + BATCH_COST * (n - 1)) scalar calls."""
+
 
 class NotFound(Exception):
     pass
@@ -63,10 +66,14 @@ class World:
     def table(self, name: str) -> dict[Any, Any]:
         return self.tables.setdefault(name, {})
 
-    async def enter(self, ctx: Ctx, name: str) -> World:
-        """Record a leaf call and simulate its latency."""
+    async def enter(self, ctx: Ctx, name: str, n: int = 1) -> World:
+        """Record a leaf call and simulate its latency.
+
+        A vector call serving n elements costs a little more than one: a
+        fixed cost, plus BATCH_COST of it per extra element.
+        """
         self.calls.append(Call(ctx.path, name))
-        delay = self.latency.get(name, self.default_latency)
+        delay = self.latency.get(name, self.default_latency) * (1 + BATCH_COST * (n - 1))
         if delay:
             await asyncio.sleep(delay)
         return self
@@ -78,10 +85,10 @@ class World:
         return [(e.name, dict(e.args)) for e in sorted(self.effects, key=lambda e: e.path)]
 
 
-async def service(ctx: Ctx, name: str) -> World:
-    """Called by leaf cells: the world, after recording the call."""
+async def service(ctx: Ctx, name: str, n: int = 1) -> World:
+    """Called by leaf cells: the world, after recording the call (of n elements)."""
     world: World = ctx.resource(World)
-    return await world.enter(ctx, name)
+    return await world.enter(ctx, name, n)
 
 
 def path_id(ctx: Ctx) -> str:

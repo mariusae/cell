@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cell demo</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f7f7f8; --border: #e2e2e6; --text: #1d1d20; --muted: #6b6b76;
+    --accent: #2f6fdf; --good: #1e8e3e; --bad: #c5221f; --warn: #b06000; --code: #f3f3f5;
+    --eager: #8a8a96; --compiled: #2f6fdf; --optimized: #1e8e3e; --batched: #a142f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151517; --panel: #1d1d21; --border: #2e2e35; --text: #e7e7ea; --muted: #9a9aa6;
+      --accent: #7aa7ff; --good: #5bc27a; --bad: #ff7a70; --warn: #f0b060; --code: #232329;
+      --eager: #9a9aa6; --compiled: #7aa7ff; --optimized: #5bc27a; --batched: #c58af9;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+         background: var(--bg); color: var(--text); display: flex; height: 100vh; }
+  nav { width: 260px; flex: none; border-right: 1px solid var(--border); background: var(--panel);
+        overflow-y: auto; padding: 16px 0; }
+  nav h1 { font-size: 16px; margin: 0 16px 4px; }
+  nav p.sub { margin: 0 16px 16px; color: var(--muted); font-size: 12px; }
+  nav h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+           margin: 16px 16px 4px; }
+  nav a { display: block; padding: 4px 16px; color: var(--text); text-decoration: none; font-size: 13px; }
+  nav a:hover { background: var(--border); }
+  nav a.active { background: var(--accent); color: white; }
+  main { flex: 1; overflow-y: auto; padding: 24px 32px 64px; }
+  header h1 { margin: 0 0 4px; font-size: 22px; }
+  header p { margin: 0; color: var(--muted); }
+  .controls { position: sticky; top: -24px; z-index: 5; background: var(--bg); margin: 16px -32px 0;
+              padding: 12px 32px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap;
+              gap: 16px; align-items: center; }
+  .controls label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  select, input[type=number] { font: inherit; padding: 3px 6px; border: 1px solid var(--border);
+                                border-radius: 6px; background: var(--bg); color: var(--text); }
+  input[type=number] { width: 80px; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent);
+           background: var(--accent); color: white; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  section { margin-top: 28px; }
+  section > h2 { font-size: 16px; margin: 0 0 4px; display: flex; gap: 10px; align-items: baseline; }
+  section > h2 .n { color: var(--muted); font-weight: 400; }
+  section > p.explain { margin: 0 0 12px; color: var(--muted); max-width: 900px; }
+  pre { background: var(--code); border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+        overflow-x: auto; margin: 0; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 420px; min-width: 0; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600;
+           border: 1px solid currentColor; }
+  .good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); } .muted { color: var(--muted); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 6px; }
+  .tabs button { background: transparent; color: var(--muted); border-color: var(--border); padding: 3px 10px; }
+  .tabs button.on { color: var(--text); border-color: var(--text); }
+  .graph { border: 1px solid var(--border); border-radius: 8px; overflow: auto; max-height: 720px;
+           background: var(--bg); padding: 8px; }
+  .graph svg { height: auto; } /* mermaid caps the width at the graph's natural size */
+  .tabs .zoom { margin-left: auto; }
+  .card-title { font-weight: 600; margin: 0 0 6px; }
+  ul.effects { margin: 4px 0 0; padding-left: 18px; font: 12px ui-monospace, Menlo, monospace; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; margin-top: 16px; }
+  .chart { border: 1px solid var(--border); border-radius: 8px; padding: 12px; height: 300px; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .empty { color: var(--muted); padding: 40px 0; }
+</style>
+</head>
+<body>
+<nav>
+  <h1>Cell</h1>
+  <p class="sub">Programs, traced and compiled</p>
+  <div id="scenarios"></div>
+</nav>
+<main id="main"><p class="empty">Pick a scenario on the left.</p></main>
+
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+
+const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({ startOnLoad: false, securityLevel: "loose", theme: dark ? "dark" : "default",
+                     flowchart: { htmlLabels: true, useMaxWidth: true } });
+
+const $ = (sel, el = document) => el.querySelector(sel);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const state = { scenarios: [], current: null, charts: [] };
+let mermaidId = 0;
+
+async function renderMermaid(el, text) {
+  try {
+    const { svg } = await mermaid.render("m" + mermaidId++, text);
+    el.innerHTML = svg;
+  } catch (e) {
+    el.innerHTML = `<pre>${esc(e.message || e)}</pre>`;
+  }
+}
+
+function graphPanel(title, view) {
+  const id = "g" + mermaidId++;
+  const kinds = Object.entries(view.kinds).map(([k, n]) => `${n} ${k}`).join(", ");
+  return `<div>
+    <p class="card-title">${esc(title)} <span class="muted">· ${view.nodes} nodes (${esc(kinds)}) · #${view.hash.slice(0, 8)}</span></p>
+    <div class="tabs" data-for="${id}">
+      <button class="on" data-tab="graph">Graph</button><button data-tab="ir">IR</button>
+      <button class="zoom" title="Toggle between fitting the panel and actual size">Actual size</button>
+    </div>
+    <div class="graph" id="${id}-graph" data-mermaid="${esc(view.mermaid)}"></div>
+    <pre id="${id}-ir" style="display:none">${esc(view.ir)}</pre>
+  </div>`;
+}
+
+function wireTabs(root) {
+  root.querySelectorAll(".tabs").forEach((tabs) => {
+    const id = tabs.dataset.for;
+    tabs.querySelector(".zoom").onclick = (ev) => {
+      const g = $(`#${id}-graph`);
+      const svg = g.querySelector("svg");
+      const actual = g.classList.toggle("actual");
+      const natural = svg?.viewBox?.baseVal?.width;
+      if (svg && natural) {
+        svg.style.width = actual ? natural + "px" : "100%";
+        svg.style.maxWidth = actual ? "none" : natural + "px";
+      }
+      ev.target.textContent = actual ? "Fit" : "Actual size";
+    };
+    tabs.querySelectorAll("button[data-tab]").forEach((b) => b.onclick = () => {
+      tabs.querySelectorAll("button[data-tab]").forEach((x) => x.classList.toggle("on", x === b));
+      $(`#${id}-graph`).style.display = b.dataset.tab === "graph" ? "" : "none";
+      $(`#${id}-ir`).style.display = b.dataset.tab === "ir" ? "" : "none";
+    });
+  });
+  root.querySelectorAll("[data-mermaid]").forEach((el) => renderMermaid(el, el.dataset.mermaid));
+}
+
+function options() {
+  const on = (id) => $("#" + id)?.checked ?? true;
+  return { inline: on("opt-inline"), fold: on("opt-fold"), dedup: on("opt-dedup"),
+           cache: $("#opt-cache")?.checked ?? false, trace_from: $("#trace-from")?.value || "" };
+}
+
+async function loadScenarios() {
+  state.scenarios = await (await fetch("/api/scenarios")).json();
+  const groups = {};
+  for (const s of state.scenarios) (groups[s.module.replace("examples.", "")] ??= []).push(s);
+  $("#scenarios").innerHTML = Object.entries(groups).map(([g, ss]) =>
+    `<h2>${esc(g)}</h2>` + ss.map((s) => `<a href="#${encodeURIComponent(s.name)}" data-name="${esc(s.name)}">${esc(s.name)}</a>`).join("")
+  ).join("");
+  window.onhashchange = () => select(decodeURIComponent(location.hash.slice(1)));
+  if (location.hash) select(decodeURIComponent(location.hash.slice(1)));
+}
+
+function select(name) {
+  const s = state.scenarios.find((x) => x.name === name);
+  if (!s) return;
+  state.current = s;
+  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.name === name));
+  $("#main").innerHTML = `
+    <header>
+      <h1>${esc(s.name)}</h1>
+      <p><code>${esc(s.cell)}(${esc(s.args)})</code>${s.doc ? " — " + esc(s.doc) : ""}</p>
+    </header>
+    <div class="controls">
+      <label>Trace from <select id="trace-from">${s.siblings.map((n) => `<option ${n === s.name ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
+      <span class="muted">Rewrites:</span>
+      <label><input type="checkbox" id="opt-inline" checked> inline</label>
+      <label><input type="checkbox" id="opt-fold" checked> fold</label>
+      <label><input type="checkbox" id="opt-dedup" checked> dedup</label>
+      <label><input type="checkbox" id="opt-cache"> cache pure calls</label>
+    </div>
+    <div id="steps"><p class="empty">Running…</p></div>
+    <section id="simulate">
+      <h2><span class="n">7</span> Simulate</h2>
+      <p class="explain">Many requests against simulated services, in simulated time. Each leaf call's latency is drawn from a
+        log-normal distribution (a median and a tail), and each service handles a limited number of calls at once, so extra
+        calls queue; a vector call takes one slot, and costs a little more per element. The four runs: eager execution, the
+        traced graph compiled as is, the graph with the rewrites (and caching) selected above, and that graph with batching:
+        requests arriving within the batch window run together and share vector calls.</p>
+      <div class="controls" style="position:static;margin:0;padding:8px 0;border:0">
+        <label>median latency (ms) <input type="number" id="sim-median" value="10" min="0.1" step="0.1"></label>
+        <label>tail (σ) <input type="number" id="sim-sigma" value="0.5" min="0" max="3" step="0.1"></label>
+        <label>capacity / service <input type="number" id="sim-capacity" value="8" min="1" max="256"></label>
+        <label>batch window (ms) <input type="number" id="sim-window" value="2" min="0" step="0.5"></label>
+        <label>max batch <input type="number" id="sim-batch" value="16" min="1" max="1024"></label>
+        <label>seed <input type="number" id="sim-seed" value="1"></label>
+      </div>
+      <div class="controls" style="position:static;margin:0;padding:0 0 8px;border:0">
+        <span class="muted">Closed loop:</span>
+        <label>requests <input type="number" id="sim-requests" value="400" min="1" max="5000"></label>
+        <label>clients <input type="number" id="sim-clients" value="8" min="1" max="256"></label>
+        <button id="simulate-btn">Simulate</button>
+      </div>
+      <div id="sim-out"></div>
+    </section>
+    <section id="curve">
+      <h2><span class="n">8</span> Load curve</h2>
+      <p class="explain">Open loop: requests arrive at random (Poisson) at a given rate, whether or not earlier ones have
+        finished, and the rate is swept up to the maximum. Latency stays flat until a service saturates, then climbs as queues
+        grow, while throughput levels off. Fewer calls per request, or fewer, bigger vector calls, move that knee to the right.
+        Uses the settings above.</p>
+      <div class="controls" style="position:static;margin:0;padding:8px 0;border:0">
+        <label>max rate (req/s) <input type="number" id="curve-max" value="1600" min="1"></label>
+        <label>points <input type="number" id="curve-points" value="8" min="2" max="16"></label>
+        <label>requests per point <input type="number" id="curve-requests" value="200" min="10" max="2000"></label>
+        <button id="curve-btn">Run load curve</button>
+      </div>
+      <div id="curve-out"></div>
+    </section>`;
+  document.querySelectorAll(".controls input[type=checkbox], #trace-from").forEach((el) => el.onchange = run);
+  $("#simulate-btn").onclick = simulate;
+  $("#curve-btn").onclick = loadCurve;
+  run();
+}
+
+function simBody() {
+  return { name: state.current.name, ...options(), capacity: +$("#sim-capacity").value,
+    median_ms: +$("#sim-median").value, sigma: +$("#sim-sigma").value, seed: +$("#sim-seed").value,
+    batch_window_ms: +$("#sim-window").value, batch_max: +$("#sim-batch").value };
+}
+
+const COLORS = () => [css("--eager"), css("--compiled"), css("--optimized"), css("--batched")];
+
+function chartOptions(title, xTitle, yTitle, extra = {}) {
+  const grid = css("--border"), text = css("--muted");
+  return {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: { title: { display: true, text: title, color: css("--text") }, legend: { labels: { color: text } } },
+    scales: { x: { title: { display: true, text: xTitle, color: text }, ticks: { color: text }, grid: { color: grid }, ...(extra.x || {}) },
+              y: { title: { display: true, text: yTitle, color: text }, ticks: { color: text }, grid: { color: grid }, beginAtZero: true, ...(extra.y || {}) } },
+  };
+}
+
+async function loadCurve() {
+  const btn = $("#curve-btn");
+  btn.disabled = true;
+  $("#curve-out").innerHTML = `<p class="empty">Sweeping load…</p>`;
+  const body = { ...simBody(), rate_max: +$("#curve-max").value, points: +$("#curve-points").value, requests: +$("#curve-requests").value };
+  const r = await (await fetch("/api/curve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
+  btn.disabled = false;
+  const all = COLORS();
+  const colors = [all[0], all[2], all[3]];
+  $("#curve-out").innerHTML = `
+    <div class="charts">
+      <div class="chart"><canvas id="k-p50"></canvas></div>
+      <div class="chart"><canvas id="k-p99"></canvas></div>
+      <div class="chart"><canvas id="k-thru"></canvas></div>
+    </div>
+    <p class="legend">Each point is ${body.requests} requests at one arrival rate. A curve stops once that run saturates
+      (p50 over 20× its unloaded p50): past that, only its queues grow.</p>`;
+  state.curveCharts?.forEach((c) => c.destroy());
+  const line = (key) => r.curves.map((c, i) => ({ label: c.label, data: c.points.map((p) => ({ x: p.rate, y: p[key] })),
+    borderColor: colors[i], backgroundColor: colors[i], borderWidth: 2, pointRadius: 3, tension: 0.2 }));
+  const logX = { x: { type: "logarithmic" } };
+  state.curveCharts = [
+    new Chart($("#k-p50"), { type: "line", data: { datasets: line("p50") },
+      options: chartOptions("p50 latency vs offered load", "offered load (req/s)", "latency (ms)", logX) }),
+    new Chart($("#k-p99"), { type: "line", data: { datasets: line("p99") },
+      options: chartOptions("p99 latency vs offered load", "offered load (req/s)", "latency (ms)", logX) }),
+    new Chart($("#k-thru"), { type: "line",
+      data: { datasets: [...line("throughput"), { label: "offered", data: r.rates.map((x) => ({ x, y: x })),
+              borderColor: css("--border"), borderDash: [4, 4], pointRadius: 0, borderWidth: 1 }] },
+      options: chartOptions("Achieved throughput", "offered load (req/s)", "completed (req/s)", logX) }),
+  ];
+}
+
+async function run() {
+  const s = state.current;
+  const o = options();
+  const q = new URLSearchParams({ name: s.name, trace_from: o.trace_from, inline: o.inline, fold: o.fold, dedup: o.dedup, cache: o.cache });
+  $("#steps").innerHTML = `<p class="empty">Running…</p>`;
+  const r = await (await fetch("/api/run?" + q)).json();
+  if (r.error) { $("#steps").innerHTML = `<p class="bad">${esc(r.error)}</p>`; return; }
+  const passes = Object.entries(r.rewritten.passes).filter(([, on]) => on).map(([p]) => p);
+  const c = r.compiled;
+  const mode = c.mode === "compiled"
+    ? `<span class="badge good">compiled</span>`
+    : `<span class="badge warn">deopt</span> <span class="muted">${esc(c.deopt || "")}</span>`;
+  const effects = (xs) => xs.length ? `<ul class="effects">${xs.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>` : `<p class="muted">No effects.</p>`;
+  $("#steps").innerHTML = `
+    <section>
+      <h2><span class="n">1</span> Source</h2>
+      <p class="explain">The cell as written: ordinary async Python. Calls to other cells go through <code>ctx</code>.</p>
+      <pre>${esc(r.source)}</pre>
+      ${r.lint.length ? `<p class="card-title" style="margin-top:10px">Lint</p><pre>${esc(r.lint.join("\n"))}</pre>` : ""}
+    </section>
+    <section>
+      <h2><span class="n">2</span> Eager run</h2>
+      <p class="explain">The body runs as Python. Every call and ctx source is journaled by its position in program order
+        (its <code>seq</code>); calls start when made, and the cell waits for all of them.</p>
+      <div class="row">
+        <div><p class="card-title">Journal</p><pre>${esc(r.eager.journal)}</pre></div>
+        <div style="flex:0 1 360px"><p class="card-title">Outcome</p><pre>${esc(r.eager.outcome)}</pre>
+          <p class="card-title" style="margin-top:10px">Effects</p>${effects(r.eager.effects)}</div>
+      </div>
+    </section>
+    <section>
+      <h2><span class="n">3</span> Trace</h2>
+      <p class="explain">The tracer runs a real request (${esc(r.traced.from)}) with its values wrapped, and records what the body
+        does as a dataflow graph: calls, ops, guards on the branches it took, and control edges that keep effects on the
+        path eager execution takes. ${r.traced.replayed ? `<b>This trace broke</b>: the graph ends in a deopt, and the request was finished by replay.` : "The trace completed."}</p>
+      <div class="row">${graphPanel("Traced graph", r.traced)}</div>
+    </section>
+    <section>
+      <h2><span class="n">4</span> Rewrites</h2>
+      <p class="explain">Passes that preserve meaning: <b>inline</b> replaces calls to composite cells with their graphs,
+        <b>fold</b> evaluates what depends only on constants, <b>dedup</b> shares identical pure computations. Applied:
+        ${passes.length ? passes.join(", ") : "none"}.</p>
+      <div class="row">${graphPanel("Before", r.traced)}${graphPanel("After", r.rewritten)}</div>
+    </section>
+    <section>
+      <h2><span class="n">5</span> Compiled run</h2>
+      <p class="explain">The rewritten graph runs as dataflow: each node starts once its inputs and edges allow, so
+        independent calls overlap. If a guard fails, or a call or op raises, the run deopts: it is replayed eagerly from
+        what it already issued. ${c.cached ? `Caching is on (${esc(r.cached_cells.join(", "))}); this is a second request, so pure calls come from the cache.` : ""}</p>
+      <p>${mode} &nbsp; ${c.matches_eager ? `<span class="badge good">matches eager</span>` : `<span class="badge bad">differs from eager</span>`}
+        <span class="muted">(same outcome, and the same effectful calls)</span></p>
+      <div class="row">
+        <div><p class="card-title">Journal</p><pre>${esc(c.journal)}</pre></div>
+        <div style="flex:0 1 360px"><p class="card-title">Outcome</p><pre>${esc(c.outcome)}</pre>
+          <p class="card-title" style="margin-top:10px">Effects</p>${effects(c.effects)}</div>
+      </div>
+    </section>
+    <section>
+      <h2><span class="n">6</span> Batch</h2>
+      <p class="explain">Every scenario of this cell, twice, run as <b>one batch</b> through the rewritten graph. Each request
+        is a lane with its own journal. Lanes share vector calls: calls to a cell with a vector form (and
+        <code>ctx.map</code>s over one) that every lane reaches go out together, as one call. A lane whose guard fails
+        deopts on its own (the batch is partitioned), and the others carry on.</p>
+      <table>
+        <tr><th>lane</th><th>mode</th><th>matches eager</th><th>calls answered by vector calls</th></tr>
+        ${r.batch.lanes.map((l, i) => `<tr><td>${i}: ${esc(l.scenario)}</td>
+          <td>${l.mode === "compiled" ? `<span class="badge good">compiled</span>` : `<span class="badge warn">deopt</span> <span class="muted">${esc(l.deopt || "")}</span>`}</td>
+          <td>${l.matches_eager ? `<span class="good">✓</span>` : `<span class="bad">✗</span>`}</td><td>${l.batched_calls}</td></tr>`).join("")}
+      </table>
+      <div class="row" style="margin-top:12px">
+        <div style="flex:0 1 420px"><p class="card-title">Leaf calls: batch vs. one request at a time</p>
+          <table><tr><th>service</th><th>batch</th><th>one by one</th></tr>
+          ${[...new Set([...Object.keys(r.batch.calls), ...Object.keys(r.batch.calls_one_by_one)])].sort().map((k) =>
+            `<tr><td>${esc(k)}</td><td>${r.batch.calls[k] || 0}</td><td>${r.batch.calls_one_by_one[k] || 0}</td></tr>`).join("")}
+          </table>
+          <p class="muted">${r.batch.vector_calls} vector calls, serving ${r.batch.vector_elements} elements.</p></div>
+        <div><p class="card-title">This scenario's lane: journal</p><pre>${esc(r.batch.journal)}</pre></div>
+      </div>
+    </section>`;
+  wireTabs($("#steps"));
+}
+
+async function simulate() {
+  const s = state.current;
+  const o = options();
+  const btn = $("#simulate-btn");
+  btn.disabled = true;
+  $("#sim-out").innerHTML = `<p class="empty">Simulating…</p>`;
+  const body = { ...simBody(), requests: +$("#sim-requests").value, clients: +$("#sim-clients").value };
+  const r = await (await fetch("/api/simulate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
+  btn.disabled = false;
+  const colors = COLORS();
+  const f = (x, d = 1) => x.toFixed(d);
+  $("#sim-out").innerHTML = `
+    <table>
+      <tr><th>run</th><th>mean</th><th>p50</th><th>p90</th><th>p99</th><th>max</th><th>throughput</th><th>leaf calls / request</th><th>modes</th></tr>
+      ${r.results.map((x, i) => `<tr>
+        <td><span class="swatch" style="background:${colors[i]}"></span>${esc(x.label)}</td>
+        <td>${f(x.mean)} ms</td><td><b>${f(x.p50)} ms</b></td><td>${f(x.p90)} ms</td><td><b>${f(x.p99)} ms</b></td><td><b>${f(x.max)} ms</b></td>
+        <td><b>${f(x.throughput, 0)}</b> req/s</td><td>${f(x.calls_per_request, 2)}</td>
+        <td class="muted">${esc(Object.entries(x.modes).map(([m, n]) => `${m} ${n}`).join(", "))}${x.errors ? ` · ${x.errors} errors` : ""}</td></tr>`).join("")}
+    </table>
+    <div class="charts">
+      <div class="chart"><canvas id="c-hist"></canvas></div>
+      <div class="chart"><canvas id="c-cdf"></canvas></div>
+      <div class="chart"><canvas id="c-thru"></canvas></div>
+      <div class="chart"><canvas id="c-pct"></canvas></div>
+    </div>
+    <p class="legend">Settings: ${esc(Object.entries(r.settings).map(([k, v]) => `${k}=${v}`).join(", "))}. Simulated time: identical settings give identical results.</p>`;
+  state.charts.forEach((c) => c.destroy());
+  const grid = css("--border"), text = css("--muted");
+  const base = (title, xTitle, yTitle) => ({
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: { title: { display: true, text: title, color: css("--text") }, legend: { labels: { color: text } } },
+    scales: { x: { title: { display: true, text: xTitle, color: text }, ticks: { color: text }, grid: { color: grid } },
+              y: { title: { display: true, text: yTitle, color: text }, ticks: { color: text }, grid: { color: grid }, beginAtZero: true } },
+  });
+  const edges = r.histogram.edges;
+  const mid = edges.slice(0, -1).map((e, i) => f((e + edges[i + 1]) / 2, 0));
+  state.charts = [
+    new Chart($("#c-hist"), { type: "bar",
+      data: { labels: mid, datasets: r.results.map((x, i) => ({ label: x.label, data: r.histogram.counts[i],
+              backgroundColor: colors[i] + "99", borderColor: colors[i], borderWidth: 1, barPercentage: 1, categoryPercentage: 0.9 })) },
+      options: base("Latency distribution", "latency (ms)", "requests") }),
+    new Chart($("#c-cdf"), { type: "line",
+      data: { labels: [...Array(100).keys()].map((p) => p + 1), datasets: r.results.map((x, i) => ({ label: x.label,
+              data: x.cdf, borderColor: colors[i], backgroundColor: colors[i], pointRadius: 0, borderWidth: 2, tension: 0.1 })) },
+      options: base("Latency by percentile", "percentile", "latency (ms)") }),
+    new Chart($("#c-thru"), { type: "bar",
+      data: { labels: r.results.map((x) => x.label), datasets: [{ label: "throughput (req/s)",
+              data: r.results.map((x) => x.throughput), backgroundColor: colors }] },
+      options: { ...base("Throughput", "", "requests / second"), plugins: { ...base("Throughput").plugins, legend: { display: false } } } }),
+    new Chart($("#c-pct"), { type: "bar",
+      data: { labels: ["p50", "p90", "p99", "max"], datasets: r.results.map((x, i) => ({ label: x.label,
+              data: [x.p50, x.p90, x.p99, x.max], backgroundColor: colors[i] })) },
+      options: base("Latency percentiles", "", "latency (ms)") }),
+  ];
+}
+
+loadScenarios();
+</script>
+</body>
+</html>

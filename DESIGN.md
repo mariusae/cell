@@ -927,6 +927,37 @@ The v0 IR avoids decisions that would block these:
 - **Structured fan-out.** `ctx.map(cell, xs)` becomes a `map` node with a
   subgraph. This is preferred over unrolled loops, because it
   vectorizes and doesn't need a length guard.
+- **vmap, as built (M5).** Rather than rewriting the graph to vector
+  form, the executor runs a batch of *lanes*: one per request, each with
+  its own state, invocation and journal, all running the same plan. A
+  single request is a batch of one. What that gives:
+  - **Guards partition.** A lane whose guard fails (or whose call or op
+    raises) deopts alone and replays eagerly; the others go on.
+  - **Vector forms.** A pure cell may declare one:
+    `@features.vectorized async def features_many(ctx, uid: list, post: list)`,
+    with the same parameters, each a list. It must agree element by
+    element with the cell. Only pure cells may have one, since a vector
+    call stands for many calls.
+  - **`ctx.map(cell, items, **fixed)`** is one call, to a built-in map
+    cell (`mapping.py`), however many items: one `seq`, one journal entry
+    (the per-item calls are under it), and one traced node, printed
+    `map features(post in %5, …)`. There is no unrolling and no length
+    guard, so one graph fits any number of items. The map cell uses the
+    target's vector form if it has one.
+  - **Fusion.** A pure call to a cell with a vector form, or a map over
+    one, waits until every running lane has reached it. Then all such
+    calls to the same cell, across nodes and lanes, go out as **one
+    vector call**, and the results are split back; each lane journals its
+    own entry, marked `batched` (no child journal). A group of one is
+    issued as is. If the vector call fails, the calls go out one by one,
+    so errors are attributed. Calls to cached cells aren't fused (the
+    cache answers them), nor are calls while replaying.
+  - **Batching.** `Runtime.execute_batch(cell, requests)` runs requests
+    as one batch. `Runtime.batch(cell, max_size=, window=)` is a policy:
+    requests for the cell wait up to `window` for others (or until
+    `max_size`), then run as a batch through the installed graph.
+  - **Stragglers.** A fused call waits for the slowest lane to reach it.
+    Splitting a batch on timeout (NOTES §11) is not done yet.
 - **Partitioning.** Placement is an annotation on nodes. A pass inserts
   `send`/`recv` edges between partitions, and each partition becomes its
   own graph (endpoint projection). A data edge between partitions sends
@@ -1053,6 +1084,33 @@ effects (§2):
 
 `uv run python -m examples --bench` prints eager, compiled and cached
 latency for every scenario.
+
+M5 is implemented as follows (details in §10, "vmap, as built"):
+
+- vector forms (`Cell.vectorized`) and `ctx.map` (`src/cell/mapping.py`);
+- the executor (`compiled.py`), which now runs a *batch* of lanes and fuses
+  vector calls;
+- `Runtime.execute_batch` and the `Runtime.batch` policy;
+- the feed example, with vector leaves and `feed_mapped`.
+
+`tests/test_vmap.py` checks:
+
+- `ctx.map`: one journaled call with one vector call under it, errors
+  attributed to items, one graph for users with any number of follows;
+- fusion within a request: the unrolled `feed`'s 15 `features` calls and
+  6 `recent_posts` calls become one vector call each;
+- batches: each lane matches eager execution (outcome, effects, exactly
+  once), a failing guard partitions a lane out, a deopt forced at every
+  node; the random programs (whose `get` has a vector form that fails on
+  some keys) run as batches the same way;
+- the batching policy, in simulated time.
+
+The demo server (`uv run python -m demo`) shows each scenario's batch, and
+sweeps load (open loop, Poisson arrivals) to plot latency and throughput
+against offered load. For `feed_mapped/busy`, with feature scoring as the
+bottleneck service (30ms, 8 at a time): eager saturates near 200 req/s,
+with p50 rising to about 450ms; batched, it reaches about 450 req/s, with
+p50 under 200ms. At low load, batching costs its window (a few ms).
 
 M3 is implemented in `src/cell/static.py` and `src/cell/monitor.py`.
 
