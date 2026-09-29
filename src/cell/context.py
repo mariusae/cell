@@ -69,19 +69,15 @@ class Ctx:
 
     def now(self) -> float:
         """The current time, in seconds. Journaled."""
-        return self._inv.source("now", {}, lambda seq: float(self._inv.runtime.clock()))
+        return self._inv.source("now", {})
 
     def random(self) -> float:
         """A number in [0, 1). Journaled; derived from the request and call path."""
-        return self._inv.source("random", {}, self._inv.derived_random)
+        return self._inv.source("random", {})
 
     def config(self, key: str, default: Any = None) -> Any:
         """A configuration value. Journaled, so replay sees the value the run saw."""
-        return self._inv.source(
-            "config",
-            {"key": key, "default": default},
-            lambda seq: self._inv.runtime.config.get(key, default),
-        )
+        return self._inv.source("config", {"key": key, "default": default})
 
     def resource(self, key: Any) -> Any:
         """A live object provided by the runtime, such as a client or a fake service.

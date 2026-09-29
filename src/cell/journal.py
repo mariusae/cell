@@ -99,6 +99,18 @@ class Journal:
     args: dict[str, Any]
     entries: list[Entry] = field(default_factory=list)
     outcome: Outcome | None = None  # None if the invocation was interrupted
+    mode: str = "eager"  # "eager", "compiled", or "deopt" (compiled, then replayed eagerly)
+    deopt: str | None = None  # why a compiled run deopted
+
+    def merged_over(self, base: Journal | None) -> Journal:
+        """A journal with this one's entries, and base's for seqs this one lacks.
+
+        After a deopt, replay needs both what the compiled attempt issued and,
+        when that attempt was itself replaying, the journal it was replaying.
+        """
+        entries = {e.seq: e for e in base.entries} if base is not None else {}
+        entries.update((e.seq, e) for e in self.entries)
+        return Journal(self.request_id, self.path, self.cell, self.args, [entries[s] for s in sorted(entries)])
 
     def entry(self, seq: int) -> Entry | None:
         for e in self.entries:
@@ -128,7 +140,8 @@ class Journal:
         """A readable tree of the invocation, for debugging (and later EXPLAIN ANALYZE)."""
         args = ", ".join(f"{k}={_short(v, 30)}" for k, v in self.args.items())
         outcome = "interrupted" if self.outcome is None else repr(self.outcome)
-        lines = [f"{indent}{_name(self.cell)}({args}) -> {outcome}"]
+        mode = {"eager": "", "compiled": "  [compiled]", "deopt": f"  [deopt: {self.deopt}]"}[self.mode]
+        lines = [f"{indent}{_name(self.cell)}({args}) -> {outcome}{mode}"]
         for e in self.entries:
             lines.append(_format_entry(e, indent + "  "))
             if e.child is not None and not e.replayed:

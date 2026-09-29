@@ -1,9 +1,13 @@
-"""The eager runtime (DESIGN §2, milestone M0).
+"""The runtime: eager execution (M0), and dispatch to compiled graphs (M2).
 
 Cell bodies run as ordinary Python. Each call is issued when it is made,
 runs in its own task, and is resolved in-process. Every invocation keeps
 a journal (DESIGN §3), and an invocation can be replayed from a journal:
 journaled calls return their recorded outcomes instead of running again.
+
+A cell with an installed graph runs from the graph instead (compiled.py).
+If the graph's assumptions fail, the invocation deopts: it is replayed
+eagerly from the journal of what the compiled run already issued.
 """
 
 from __future__ import annotations
@@ -20,6 +24,8 @@ from . import data
 from .context import Ctx, Handle
 from .core import Cell
 from .errors import ContextError, DataError, DeterminismError
+from .compiled import Plan, compile_graph, run_plan
+from .graph import Graph
 from .journal import Entry, Err, Journal, Ok, Outcome
 from .semantics import Domain, check_domain
 
@@ -56,6 +62,7 @@ class Invocation:
         self._next_seq = 0
         self._interrupt_at = interrupt_at
         self._domains: list[Domain] = []
+        self.replay = replay
         self._replay = None if replay is None else {e.seq: e for e in replay.entries}
 
     # Issuing
@@ -81,16 +88,21 @@ class Invocation:
         self._next_seq += 1
         return seq
 
-    def call(self, cell: Cell, arguments: dict[str, Any]) -> Handle[Any]:
+    def call(
+        self, cell: Cell, arguments: dict[str, Any], *, seq: int | None = None, domain: Domain | None = None
+    ) -> Handle[Any]:
+        """Issue a call. Compiled execution passes the seq and domain recorded in the graph."""
         self._check_ctx()
         try:
             data.flatten(arguments, is_leaf=_is_handle)
         except DataError as e:
             raise DataError(f"argument to {cell.id} is not data: {e}") from None
-        seq = self._issue()
-        domain = None
-        if cell.effectful:
-            domain = self._domains[-1] if self._domains else cell.domain
+        if seq is None:
+            seq = self._issue()
+            if cell.effectful:
+                domain = self._domains[-1] if self._domains else cell.domain
+        elif not cell.effectful:
+            domain = None
         entry = Entry(seq=seq, kind="call", target=cell.id, effectful=cell.effectful, domain=domain)
         self.journal.entries.append(entry)
         task = asyncio.create_task(
@@ -102,9 +114,11 @@ class Invocation:
         self.children.append(handle)
         return handle
 
-    def source(self, name: str, args: dict[str, Any], compute: Callable[[int], Any]) -> Any:
+    def source(self, name: str, args: dict[str, Any], *, seq: int | None = None) -> Any:
+        """A ctx source (now, random, config), journaled at the next seq or the given one."""
         self._check_ctx()
-        seq = self._issue()
+        if seq is None:
+            seq = self._issue()
         entry = Entry(seq=seq, kind="source", target=name, args=args, args_digest=data.digest(args))
         self.journal.entries.append(entry)
         hit = self.lookup(entry)
@@ -112,12 +126,21 @@ class Invocation:
             value = hit.outcome.value
             entry.replayed = True
         else:
-            value = compute(seq)
+            value = self._compute_source(name, args, seq)
             data.check(value)
         entry.started = True
         entry.awaited = True
         entry.outcome = Ok(value)
         return value
+
+    def _compute_source(self, name: str, args: dict[str, Any], seq: int) -> Any:
+        if name == "now":
+            return float(self.runtime.clock())
+        if name == "random":
+            return self.derived_random(seq)
+        if name == "config":
+            return self.runtime.config.get(args["key"], args["default"])
+        raise ValueError(f"unknown ctx source {name!r}")
 
     def derived_random(self, seq: int) -> float:
         key = f"{self.runtime.seed}|{self.journal.request_id}|{self.journal.path}|{seq}"
@@ -142,7 +165,7 @@ class Invocation:
         if old.key == entry.key:
             self.consumed.add(entry.seq)
             return old
-        if old.effectful:
+        if old.effectful and old.started:  # one that never started had no effect
             err = DeterminismError(
                 f"replay of {self.cell.id} at {self.journal.path + (entry.seq,)}: the journal has "
                 f"effectful {old.target}({old.args_digest}) but the body issued "
@@ -170,6 +193,7 @@ class Runtime:
         self.clock = clock or time.time
         self.seed = seed
         self._request_ids = itertools.count(1)
+        self._plans: dict[str, Plan] = {}
 
     def resource(self, key: Any) -> Any:
         try:
@@ -213,7 +237,7 @@ class Runtime:
         if request_id is None:
             request_id = replay.request_id if replay is not None else self.new_request_id()
         inv = await self.root(cell, arguments, request_id, replay=replay, interrupt_at=interrupt_at)
-        return self.run_of(inv, replay)
+        return self.run_of(inv)
 
     def new_request_id(self) -> str:
         return f"r{next(self._request_ids)}"
@@ -234,15 +258,62 @@ class Runtime:
             self._invoke(cell, arguments, (), request_id, replay, interrupt_at, make_ctx, body)
         )
 
-    def run_of(self, inv: Invocation, replay: Journal | None = None) -> Run:
+    def run_of(self, inv: Invocation) -> Run:
         unconsumed: tuple[Entry, ...] = ()
-        if replay is not None:
+        if inv.replay is not None:
             unconsumed = tuple(
                 e
-                for e in replay.entries
+                for e in inv.replay.entries
                 if e.seq not in inv.consumed and e.kind == "call" and e.effectful and e.started
             )
         return Run(inv.journal, inv.interrupted, unconsumed)
+
+    # Compiled execution (DESIGN §2, §6)
+
+    def install(self, graph: Graph) -> Plan:
+        """Run invocations of the graph's cell from the graph, whether at the root or nested.
+
+        The graph must be for the current code of its cell. Installing a
+        second graph for a cell replaces the first.
+        """
+        plan = compile_graph(graph)
+        self._plans[graph.cell] = plan
+        return plan
+
+    def uninstall(self, cell: Cell) -> None:
+        self._plans.pop(cell.id, None)
+
+    def plan(self, cell: Cell) -> Plan | None:
+        plan = self._plans.get(cell.id)
+        return plan if plan is not None and plan.cell is cell else None
+
+    async def _invoke_compiled(
+        self,
+        plan: Plan,
+        cell: Cell,
+        arguments: dict[str, Any],
+        path: tuple[int, ...],
+        request_id: str,
+        replay: Journal | None,
+    ) -> Invocation:
+        inv = Invocation(self, cell, arguments, path, request_id, replay, None)
+        inv.task = asyncio.current_task()
+        inv.journal.mode = "compiled"
+        result = await run_plan(plan, inv, arguments)
+        inv.finished = True
+        if isinstance(result, Ok):
+            inv.journal.entries.sort(key=lambda e: e.seq)
+            inv.journal.outcome = result
+            return inv
+        # Deopt (DESIGN §6.3): replay eagerly from what the compiled attempt
+        # issued, including calls still in flight, which replay waits for.
+        merged = inv.journal.merged_over(replay)
+        eager = await self._invoke(cell, arguments, path, request_id, merged, compiled=False)
+        if inv.children:
+            await asyncio.gather(*(h._task for h in inv.children), return_exceptions=True)
+        eager.journal.mode = "deopt"
+        eager.journal.deopt = result.reason
+        return eager
 
     async def _invoke(
         self,
@@ -254,7 +325,12 @@ class Runtime:
         interrupt_at: int | None = None,
         make_ctx: Callable[[Invocation], Ctx] = Ctx,
         body: Body | None = None,
+        compiled: bool = True,
     ) -> Invocation:
+        if compiled and body is None and interrupt_at is None:
+            plan = self.plan(cell)
+            if plan is not None:
+                return await self._invoke_compiled(plan, cell, arguments, path, request_id, replay)
         inv = Invocation(self, cell, arguments, path, request_id, replay, interrupt_at)
         inv.task = asyncio.current_task()
         result: Any = None
@@ -315,10 +391,15 @@ class Runtime:
                 return hit.outcome
             if hit.handle is None:
                 raise RuntimeError(f"journal entry {hit.key} has neither an outcome nor a handle")
-            try:  # the call was still in flight when the journal was taken
-                return Ok(await hit.handle._task)
+            # The call was still in flight when the journal was taken: wait for
+            # it, then take its outcome and the callee's journal.
+            try:
+                outcome: Outcome = Ok(await hit.handle._task)
             except Exception as e:
-                return Err(e)
+                outcome = Err(e)
+            entry.started = hit.started
+            entry.child = hit.child
+            return hit.outcome if hit.outcome is not None else outcome
 
         entry.started = True
         inv = await self._invoke(cell, arguments, parent.journal.path + (entry.seq,), parent.journal.request_id)

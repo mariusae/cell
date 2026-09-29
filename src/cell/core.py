@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
+import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, overload
 
@@ -15,6 +16,22 @@ if TYPE_CHECKING:
     from .context import Handle
 
 _ALLOWED_KINDS = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+
+# Every cell and op, by id, so a graph's references can be resolved. More
+# than one can share an id (a function redefined in a test, say); the code
+# hash tells them apart.
+_CELLS: dict[str, weakref.WeakSet[Cell]] = {}
+_OPS: dict[str, weakref.WeakSet[Op]] = {}
+
+
+def find_cell(id: str, code: str) -> Cell | None:
+    """The cell with this id and code hash, if one exists in this process."""
+    return next((c for c in _CELLS.get(id, ()) if c.code_hash == code), None)
+
+
+def find_op(id: str, code: str) -> Op | None:
+    """The op with this id and code hash, if one exists in this process."""
+    return next((o for o in _OPS.get(id, ()) if o.code_hash == code), None)
 
 
 class Cell:
@@ -47,6 +64,7 @@ class Cell:
         self._sig = sig
         self._ctx_param = params[0].name
         functools.update_wrapper(self, fn)
+        _CELLS.setdefault(self.id, weakref.WeakSet()).add(self)
 
     @property
     def effectful(self) -> bool:
@@ -126,6 +144,7 @@ class Op:
         self.fn = fn
         self.id = f"{fn.__module__}.{fn.__qualname__}"
         functools.update_wrapper(self, fn)
+        _OPS.setdefault(self.id, weakref.WeakSet()).add(self)
 
     @functools.cached_property
     def code_hash(self) -> str:

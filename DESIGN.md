@@ -738,6 +738,29 @@ Speculated pure calls on the wrong branch may sit in the journal under a
 `seq` that eager assigns to a different call. The key check detects this
 as a miss, and a miss on a pure call just executes.
 
+**What deopts.** In M2, any failure in a compiled run deopts: a guard that
+doesn't hold, a `deopt` node, and any op or call that raises. Errors
+therefore always come from eager execution, which defines them. A failed
+call deopts even if nothing used its result, because the graph can't tell
+a call that was awaited and ignored (eager raises) from one that was
+never awaited (eager discards the error). Recording which calls were
+observed would let the executor skip that deopt.
+
+**Replay after a deopt** uses the compiled attempt's journal, merged over
+the journal the invocation was itself replaying from, if any (as in
+validation, §9). Calls the attempt left in flight are waited for, by
+replay where it reaches them and by the invocation afterwards, so every
+call issued still completes before the invocation does.
+
+**Executing a graph** (`compiled.py`). A node starts once every node it
+refers to (data inputs, `path`, `effect`) has completed successfully and
+its `after` node has been issued. Calls and sources are issued at the
+`seq` the graph recorded, so the journal is keyed as eager would key it.
+A call to a *pure* cell may also start when an input call has only been
+issued, taking its handle (§1.5). An effectful call never does: edge
+reduction (§4.3) leaves out path edges that a data input implies, which
+holds only if data inputs complete before the node starts.
+
 ---
 
 ## 7. Correctness argument
@@ -817,10 +840,12 @@ vmap pass needs anyway to split vectors (§10).
 - is used for the safety checks in NOTES (capabilities, legality of
   policies). It is never used for optimization.
 
-**Differential validator:**
+**Differential validator** (`validate.py`):
 
 - Take recorded requests (inputs plus journaled call results) and run each
-  one in eager mode and in compiled mode against the recorded results.
+  one in compiled mode against the recorded results. The record is the
+  eager run, so only the compiled run is needed, and no services: calls
+  are answered from the journal.
 - Compare the result, the error, the multiset of effectful calls (cell and
   args), and the order constraints between them.
 - A graph is **promoted** to active only after passing on a sample set.
@@ -926,6 +951,22 @@ M1 is implemented in `src/cell/graph.py` and `src/cell/trace.py`.
 
 Targeted tests cover each rule of §5.2 and the edges of §4.3–4.4.
 
+M2 is implemented in `src/cell/compiled.py` (the executor), the runtime
+(`Runtime.install`, and deopt into eager replay) and
+`src/cell/validate.py`. `tests/test_compiled.py` checks:
+
+- every graph traced from a scenario, run on every scenario of the same
+  cell, matches eager execution, whether it runs compiled or deopts;
+- a deopt forced at each node of each graph still matches;
+- the validator accepts every graph against recorded runs, and rejects a
+  graph that returns the wrong value;
+- independent calls run in parallel, pure calls are speculated past a
+  guard, effects are not, and nested cells run compiled.
+
+`tests/test_random_programs.py` generates 60 programs from a small
+grammar (§9), traces each on several inputs, and runs every graph on
+every input, plus a deopt forced at each node, against eager execution.
+
 ---
 
 ## 12. Open questions
@@ -948,6 +989,12 @@ Targeted tests cover each rule of §5.2 and the edges of §4.3–4.4.
    principled answer; source-plus-deploy-version is the practical one.
 7. **Trace sampling policy and trace storage format,** including how much
    argument data to keep.
+8. **Speculated calls share call paths.** A pure call speculated past a
+   failing guard runs at its recorded `seq`, and eager replay may issue a
+   different call at the same `seq`. Both run with the same call path.
+   Effects are never speculated, so path-derived idempotency keys stay
+   unique, but a leaf that uses its path for anything else would see it
+   twice. Speculated calls could get a distinct path instead.
 
 ---
 
