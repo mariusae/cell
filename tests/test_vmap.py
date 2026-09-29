@@ -284,3 +284,30 @@ def test_cached_cells_are_not_fused():
     names = Counter(c.name for c in w.calls)
     assert names["following"] == 1 and names["following_many"] == 0  # the second hit the cache
     assert Feed and features and recent_posts
+
+
+def test_lanes_finish_as_soon_as_they_are_done():
+    """A request doesn't wait for the rest of its batch (regression: it used to,
+    so every request paid for its batch's slowest lane)."""
+    graph = run(trace(rt(), feed_mapped, (1,))).graph
+
+    async def go():
+        runtime = rt(World(tables(), default_latency=0.010))
+        runtime.install(graph)
+        runtime.batch(feed_mapped, max_size=2, window=0.001)
+        loop = asyncio.get_running_loop()
+        done = {}
+
+        async def one(uid):
+            r = await runtime.run(feed_mapped, uid)
+            done[uid] = (loop.time(), r.journal.mode)
+
+        await asyncio.gather(one(4), one(1))
+        return done, runtime.batch_stats["batches"]
+
+    (done, batches), _ = simtime.run(go())
+    assert batches == 1
+    # User 4 follows nobody: its lane deopts at the last guard and replays at
+    # once; user 1's lane still has mark_seen (10ms) to do.
+    assert done[4][1] == "deopt" and done[1][1] == "compiled"
+    assert done[1][0] - done[4][0] > 0.005  # it was 0, when both waited for the batch

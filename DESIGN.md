@@ -956,8 +956,17 @@ The v0 IR avoids decisions that would block these:
     as one batch. `Runtime.batch(cell, max_size=, window=)` is a policy:
     requests for the cell wait up to `window` for others (or until
     `max_size`), then run as a batch through the installed graph.
+  - **Each lane finishes on its own.** A request is answered as soon as
+    its lane is done, and a lane that deopts starts its replay at once;
+    neither waits for the rest of the batch. (At first they did: every
+    request in a batch then paid for its slowest lane's tail, which made
+    batching a regression under light load.)
   - **Stragglers.** A fused call waits for the slowest lane to reach it.
     Splitting a batch on timeout (NOTES §11) is not done yet.
+  - **When batching pays.** Only under contention. If no service queues,
+    fewer calls save nothing, and batching costs its window and a vector
+    call's per-element cost. With more requests in flight than services
+    have slots, fewer and bigger calls mean shorter queues.
 - **Partitioning.** Placement is an annotation on nodes. A pass inserts
   `send`/`recv` edges between partitions, and each partition becomes its
   own graph (endpoint projection). A data edge between partitions sends
@@ -1107,10 +1116,12 @@ M5 is implemented as follows (details in §10, "vmap, as built"):
 
 The demo server (`uv run python -m demo`) shows each scenario's batch, and
 sweeps load (open loop, Poisson arrivals) to plot latency and throughput
-against offered load. For `feed_mapped/busy`, with feature scoring as the
-bottleneck service (30ms, 8 at a time): eager saturates near 200 req/s,
-with p50 rising to about 450ms; batched, it reaches about 450 req/s, with
-p50 under 200ms. At low load, batching costs its window (a few ms).
+against offered load. For `feed_mapped/top2`, with feature scoring as the
+bottleneck service (30ms, 8 at a time): eager saturates near 230 req/s,
+with p50 rising to about 390ms; batched, it reaches over 600 req/s, with
+p50 near 110ms. At low load, batching costs about 1ms. Closed loop with
+32 clients and 8 slots per service, batching halves p50 (137ms to 67ms)
+and doubles throughput (220 to 438 req/s).
 
 M3 is implemented in `src/cell/static.py` and `src/cell/monitor.py`.
 

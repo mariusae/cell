@@ -183,7 +183,9 @@ function select(name) {
         log-normal distribution (a median and a tail), and each service handles a limited number of calls at once, so extra
         calls queue; a vector call takes one slot, and costs a little more per element. The four runs: eager execution, the
         traced graph compiled as is, the graph with the rewrites (and caching) selected above, and that graph with batching:
-        requests arriving within the batch window run together and share vector calls.</p>
+        requests arriving within the batch window run together and share vector calls. Batching pays off under
+        contention: with no more clients than a service has slots, nothing queues, so fewer calls save nothing, and
+        batching costs its window (and a vector call's per-element cost). Try more clients than capacity.</p>
       <div class="controls" style="position:static;margin:0;padding:8px 0;border:0">
         <label>median latency (ms) <input type="number" id="sim-median" value="10" min="0.1" step="0.1"></label>
         <label>tail (σ) <input type="number" id="sim-sigma" value="0.5" min="0" max="3" step="0.1"></label>

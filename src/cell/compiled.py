@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -105,15 +106,26 @@ async def run_plan(plan: Plan, inv: Invocation, arguments: dict[str, Any]) -> Ok
     return (await run_batch(plan, [inv], [arguments]))[0]
 
 
-async def run_batch(plan: Plan, invs: list[Invocation], arguments: list[dict[str, Any]]) -> list[Ok | Deopt]:
-    """Run a plan as a batch of invocations, one lane each. The caller replays each lane that deopts."""
-    batch = _Batch(plan, [_Run(plan, inv, args) for inv, args in zip(invs, arguments)])
-    outcomes = await batch.run()
-    for outcome in outcomes:
+async def run_batch(
+    plan: Plan,
+    invs: list[Invocation],
+    arguments: list[dict[str, Any]],
+    on_outcome: Callable[[int, Ok | Deopt], None] | None = None,
+) -> list[Ok | Deopt]:
+    """Run a plan as a batch of invocations, one lane each. The caller replays each lane that deopts.
+
+    `on_outcome(i, outcome)` is called as soon as lane i is done, before the rest of the batch.
+    """
+
+    def count(i: int, outcome: Ok | Deopt) -> None:
         plan.runs += 1
         if isinstance(outcome, Deopt):
             plan.deopts[outcome.reason] += 1
-    return outcomes
+        if on_outcome is not None:
+            on_outcome(i, outcome)
+
+    batch = _Batch(plan, [_Run(plan, inv, args) for inv, args in zip(invs, arguments)], count)
+    return await batch.run()
 
 
 class _Run:
@@ -126,6 +138,7 @@ class _Run:
         self.batch: _Batch | None = None
         self.deferred: dict[int, dict[str, Any]] = {}  # node -> arguments, waiting for a vector call
         self.vectored: set[int] = set()  # nodes whose calls are in flight in a vector call
+        self.closed = False
         self.nodes = plan.graph.nodes
         self.done: set[int] = set()  # completed successfully
         self.values: dict[int, Any] = {}
@@ -153,6 +166,9 @@ class _Run:
         )
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
         for scope, sub in self.scopes.items():
             if scope:
                 # Calls inlined callees left in flight complete before the
@@ -327,9 +343,12 @@ type _Element = tuple[_Run, int, dict[str, Any], str, int]  # lane, node, argume
 class _Batch:
     """Runs lanes together, and sends their vector-capable calls as vector calls."""
 
-    def __init__(self, plan: Plan, lanes: list[_Run]):
+    def __init__(
+        self, plan: Plan, lanes: list[_Run], on_outcome: Callable[[int, Ok | Deopt], None] | None = None
+    ):
         self.plan = plan
         self.lanes = lanes
+        self.on_outcome = on_outcome
         self.runtime = lanes[0].inv.runtime
         for lane in lanes:
             lane.batch = self
@@ -358,6 +377,17 @@ class _Batch:
     def _active(self) -> list[_Run]:
         return [lane for i, lane in enumerate(self.lanes) if i not in self.outcomes]
 
+    def _resolve(self, i: int, outcome: Ok | Deopt) -> None:
+        """A lane is done: report it now, not when the whole batch is.
+
+        Otherwise every request in a batch would wait for its slowest lane,
+        and a lane that deopted would wait to start its replay.
+        """
+        self.outcomes[i] = outcome
+        self.lanes[i].close()
+        if self.on_outcome is not None:
+            self.on_outcome(i, outcome)
+
     async def run(self) -> list[Ok | Deopt]:
         try:
             while True:
@@ -366,20 +396,21 @@ class _Batch:
                         continue
                     lane._start_ready()
                     if lane.deopt is not None:
-                        self.outcomes[i] = Deopt(lane.deopt)
+                        self._resolve(i, Deopt(lane.deopt))
                 if self._flush():
                     continue  # it completed nodes (maps over nothing): start what they unblock
                 for i, lane in enumerate(self.lanes):
                     if i not in self.outcomes and lane.finished:
                         assert lane.result is not None
-                        self.outcomes[i] = lane.result
+                        self._resolve(i, lane.result)
                 active = self._active()
                 if not active:
                     return [self.outcomes[i] for i in range(len(self.lanes))]
                 waiting = {t: lane for lane in active for t in lane.tasks}
                 if not waiting and not self.vector_tasks:
                     for i in range(len(self.lanes)):
-                        self.outcomes.setdefault(i, Deopt("stalled: nodes that can never start"))
+                        if i not in self.outcomes:
+                            self._resolve(i, Deopt("stalled: nodes that can never start"))
                     continue
                 finished, _ = await asyncio.wait([*waiting, *self.vector_tasks], return_when=asyncio.FIRST_COMPLETED)
                 for task in finished:

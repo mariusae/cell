@@ -78,3 +78,20 @@ def test_load_curve():
     for c in j["curves"]:
         for p in c["points"]:
             assert p["p50"] <= p["p99"] <= p["max"] and p["throughput"] > 0
+
+
+def test_batching_wins_under_contention():
+    from demo import sim
+    from demo.app import _graphs
+    from examples import scenario
+    from examples.bench import PROFILES
+
+    s = scenario("feed_mapped/top2")
+    _, graph = _graphs(s, s, True, True, True)
+    settings = sim.Settings(requests=300, clients=32, capacity=8)
+    medians = PROFILES["examples.feed"]
+    plain = sim.run(s, sim.Variant("compiled", graph), settings, medians).summarize()
+    batched = sim.run(s, sim.Variant("batched", graph, (), (16, 0.002)), settings, medians).summarize()
+    assert batched["p50"] < plain["p50"] / 1.5
+    assert batched["throughput"] > plain["throughput"] * 1.5
+    assert batched["calls_per_request"] < plain["calls_per_request"]

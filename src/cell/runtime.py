@@ -306,32 +306,53 @@ class Runtime:
             items.append((arguments, request_id or self.new_request_id()))
         return await self._execute_batch(cell, items)
 
-    async def _execute_batch(self, cell: Cell, items: list[tuple[dict[str, Any], str]]) -> list[Run]:
+    async def _execute_batch(
+        self,
+        cell: Cell,
+        items: list[tuple[dict[str, Any], str]],
+        on_run: Callable[[int, Run], None] | None = None,
+    ) -> list[Run]:
+        """Run a batch; `on_run(i, run)` hears about each request as soon as it's done."""
         plan = self.plan(cell)
         if plan is None:
-            invs = await asyncio.gather(*(self.root(cell, a, r) for a, r in items))
-            return [self.run_of(inv) for inv in invs]
+            async def alone(i: int, arguments: dict[str, Any], request_id: str) -> Run:
+                run = self.run_of(await self.root(cell, arguments, request_id))
+                if on_run is not None:
+                    on_run(i, run)
+                return run
+
+            return list(await asyncio.gather(*(alone(i, a, r) for i, (a, r) in enumerate(items))))
         self.batch_stats["batches"] += 1
         self.batch_stats["requests"] += len(items)
-        invs = await asyncio.create_task(self._invoke_batch(plan, cell, items))
+        invs = await asyncio.create_task(self._invoke_batch(plan, cell, items, on_run))
         return [self.run_of(inv) for inv in invs]
 
-    async def _invoke_batch(self, plan: Plan, cell: Cell, items: list[tuple[dict[str, Any], str]]) -> list[Invocation]:
+    async def _invoke_batch(
+        self,
+        plan: Plan,
+        cell: Cell,
+        items: list[tuple[dict[str, Any], str]],
+        on_run: Callable[[int, Run], None] | None = None,
+    ) -> list[Invocation]:
         invs = []
         for arguments, request_id in items:
             inv = Invocation(self, cell, arguments, (), request_id, None, None)
             inv.task = asyncio.current_task()
             inv.journal.mode = "compiled"
             invs.append(inv)
-        results = await run_batch(plan, invs, [a for a, _ in items])
-        # Lanes that deopted replay concurrently, each in its own task.
-        finals = await asyncio.gather(
-            *(
-                self._finish(inv, result, plan, cell, arguments, (), request_id, None)
-                for inv, result, (arguments, request_id) in zip(invs, results, items)
-            )
-        )
-        return list(finals)
+        finishing: dict[int, asyncio.Task[Invocation]] = {}
+
+        def done(i: int, result: Ok | Deopt) -> None:
+            # Finish a lane as soon as it's done: a request doesn't wait for the
+            # rest of its batch, and a lane that deopted starts its replay now.
+            arguments, request_id = items[i]
+            task = asyncio.create_task(self._finish(invs[i], result, plan, cell, arguments, (), request_id, None))
+            finishing[i] = task
+            if on_run is not None:
+                task.add_done_callback(lambda t: t.cancelled() or t.exception() or on_run(i, self.run_of(t.result())))
+
+        await run_batch(plan, invs, [a for a, _ in items], done)
+        return [await finishing[i] for i in range(len(items))]
 
     def _batcher(self, cell: Cell) -> _Batcher:
         loop = asyncio.get_running_loop()
@@ -605,8 +626,12 @@ class _Batcher:
             asyncio.get_running_loop().create_task(self._run(batch))
 
     async def _run(self, batch: list[tuple[dict[str, Any], str, asyncio.Future[Run]]]) -> None:
+        def answer(i: int, run: Run) -> None:  # as soon as each request is done
+            if not batch[i][2].done():
+                batch[i][2].set_result(run)
+
         try:
-            runs = await self.runtime._execute_batch(self.cell, [(a, r) for a, r, _ in batch])
+            runs = await self.runtime._execute_batch(self.cell, [(a, r) for a, r, _ in batch], answer)
         except BaseException as e:
             for _, _, future in batch:
                 if not future.done():
