@@ -137,6 +137,9 @@ def encode(value: Any) -> str:
 
     Equal data encodes equally, and values of different types never do
     (1, 1.0, True and "1" are all distinct). Dict keys are sorted.
+
+    This is for comparing and hashing values (see `digest`), not for
+    serialization: there is no decoder, and the encoding may change.
     """
     leaves, tree = flatten(value)
     return _encode(tree, iter(leaves))
