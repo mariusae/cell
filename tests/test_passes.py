@@ -27,6 +27,7 @@ from cell.passes import dedup, fold, inline, optimize
 from cell.trace import trace
 from examples import SCENARIOS, simtime
 from examples.features import concurrent, kv_get, kv_put, nested, sum_keys
+from examples.bench import callee_graphs
 from examples.harness import Scenario, World
 from test_random_programs import NAMESPACE, Generator, assert_effects_match
 
@@ -46,13 +47,10 @@ def assert_equivalent(r, eager, world, eager_world, context=""):
     assert_effects_match(r, eager, world, eager_world, context)
 
 
-def optimized(s: Scenario):
-    graph = run(s.trace())[0].graph
-    callees = {}
-    if s.cell is nested:  # the one example with a composite callee
-        w = World({"kv": {"a": 1, "b": 2}})
-        callees[sum_keys.id] = run(trace(Runtime(resources={World: w}), sum_keys, (("a", "b"),))).graph
-    return optimize(graph, callees)
+def optimized(s: Scenario, **passes):
+    """The scenario's graph, with its composite callees traced from the calls it made, and inlined."""
+    traced = run(s.trace())[0]
+    return optimize(traced.graph, run(callee_graphs(s, traced.run.journal)), **passes)
 
 
 def run_graph(graph, s: Scenario, fail_at=None):
@@ -342,3 +340,51 @@ def _home_pure():
     from examples.home import get_items, get_user, rank
 
     return [get_user, get_items, rank]
+
+
+# The profile page: inlining, and what it enables
+
+
+def test_profile_inlines_its_helpers_and_shares_their_calls():
+    s = next(s for s in SCENARIOS if s.name == "profile/ada")
+    graph = optimized(s)
+    kinds = Counter(n.kind for n in graph.nodes)
+    # header and the full card are inlined; the compact card can't match
+    # card's traced specialization (its style guard folds to false), so it stays a call.
+    assert kinds["enter"] == 2 and kinds["guard"] == 0
+    calls = Counter(n.attrs["cell"].rsplit(".", 1)[-1] for n in graph.nodes if n.kind == "call")
+    assert calls == Counter({"get_user": 1, "get_settings": 1, "translate": 1, "card": 1, "record_view": 1})
+
+
+def test_inlining_without_folding_still_leaves_hopeless_call_sites_alone():
+    s = next(s for s in SCENARIOS if s.name == "profile/ada")
+    graph = optimized(s, folding=False, dedupe=False)
+    r, _ = run_graph(graph, s)
+    assert r.journal.mode == "compiled"
+
+
+@pytest.mark.parametrize(
+    "passes, expected_ms, expected_calls",
+    [
+        (None, 40.0, 8),  # eager
+        ({"inlining": False, "folding": False, "dedupe": False}, 30.0, 8),
+        ({"folding": False, "dedupe": False}, 20.0, 8),  # header's fetches overlap
+        ({}, 20.0, 5),  # and the user and settings are fetched once
+    ],
+    ids=["eager", "compiled", "inlined", "inlined+fold+dedup"],
+)
+def test_profile_latency_and_calls(passes, expected_ms, expected_calls):
+    s = next(s for s in SCENARIOS if s.name == "profile/ada")
+    graph = None if passes is None else optimized(s, **passes)
+
+    async def go():
+        world = World(s.tables(), default_latency=0.010)
+        runtime = s.runtime(world)
+        if graph is not None:
+            runtime.install(graph)
+        r = await runtime.execute(s.cell, s.args, request_id="req")
+        return r, world
+
+    (r, world), elapsed = simtime.run(go())
+    assert r.value == s.expect
+    assert (round(elapsed * 1000, 3), len(world.calls)) == (expected_ms, expected_calls)

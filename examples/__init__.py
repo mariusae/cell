@@ -1,12 +1,13 @@
 """Example programs, and the scenarios every milestone is checked against."""
 
-from . import checkout, features, feed, home
+from . import checkout, features, feed, home, profile
 from .harness import Scenario
 
 SCENARIOS: list[Scenario] = [
     *home.SCENARIOS,
     *feed.SCENARIOS,
     *checkout.SCENARIOS,
+    *profile.SCENARIOS,
     *features.SCENARIOS,
 ]
 

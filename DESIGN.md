@@ -1025,6 +1025,12 @@ so the benefit of each idea can be measured locally.
 3. **Checkout:** effectful calls (reserve, charge, confirm). Exercises
    ordering, control edges, and deopt correctness in the presence of
    effects. Later, sagas.
+4. **Profile page:** a page built from composite helpers (`header`,
+   `card`) that fetch some of what the page fetches. Inlining them lets
+   dataflow, dedup and folding work across the boundary: 40ms eager (30ms
+   compiled) becomes 20ms, and 8 leaf calls become 5. One call site
+   (`card(…, "compact")`) can't match the traced specialization, so it
+   stays a call.
 
 **Status.** M0 is implemented in `src/cell`. The example programs are in
 `examples/`: the three applications above, plus `features.py`, a set of

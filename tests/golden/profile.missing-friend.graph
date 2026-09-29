@@ -1,0 +1,11 @@
+graph profile #fdc216d9 (uid)
+  %0 = param uid
+  %1 = call header(%0)                            pure  seq=0                            examples/profile.py:113
+  %2 = call card(%0, 'full')                      pure  seq=1                            examples/profile.py:114
+  %3 = call get_user(%0)                          pure  seq=2                            examples/profile.py:115
+  %4 = op %3.best_friend                                                                 examples/profile.py:116
+  %5 = call card(%4, 'compact')                   pure  seq=3                            examples/profile.py:116
+  %6 = call get_settings(%0)                      pure  seq=4                            examples/profile.py:117
+  %7 = op %6.locale                                                                      examples/profile.py:118
+  %8 = call record_view(%0, %7)                   effectful[main]  seq=5  path=[%2, %4]  examples/profile.py:118
+  %9 = deopt: %5 failed while tracing (NotFound)  path=[%1, %5, %8]                      examples/profile.py:119

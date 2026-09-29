@@ -166,17 +166,19 @@ def optimize(
 ) -> Graph:
     """The standard pipeline: inline composite callees, fold constants, share what's identical.
 
-    Each pass can be turned off. With folding, a callee inlined at a call
-    site where one of its guards can never hold would make every run
-    deopt; such call sites are left as calls.
+    Each pass can be turned off. A callee inlined at a call site where one
+    of its guards can never hold (as folding shows) would make every run
+    deopt; such call sites are left as calls, with or without folding.
     """
     exclude: set[tuple[int, ...]] = set()
     while True:
         out = inline(graph, callees or {}, exclude=exclude) if inlining else graph
-        if folding:
-            out = fold(out)
-        bad = {scope[:1] for scope in doomed(out)} - exclude
+        folded = fold(out)
+        # Folding finds the call sites where an inlined guard can never hold,
+        # whether or not the folded graph is the one returned.
+        bad = {scope[:1] for scope in doomed(folded)} - exclude
         if not bad:
+            out = folded if folding else out
             return dedup(out) if dedupe else out
         exclude |= bad
 
