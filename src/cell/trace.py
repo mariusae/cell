@@ -610,4 +610,4 @@ def _site() -> str | None:
         f = f.f_back
     if f is None or f.f_code.co_filename.startswith(_ASYNCIO):
         return None
-    return f"{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}"
+    return f"{os.path.abspath(f.f_code.co_filename)}:{f.f_lineno}"

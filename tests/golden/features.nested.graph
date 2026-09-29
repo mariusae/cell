@@ -1,5 +1,5 @@
 graph nested #04dbe324 ()
-  %0 = call sum_keys(('a', 'b'))  effectful[main]  seq=0               features.py:102
-  %1 = call sum_keys(('a',))      effectful[main]  seq=1  effect=[%0]  features.py:102
-  %2 = op %0 + %1                                                      features.py:102
+  %0 = call sum_keys(('a', 'b'))  effectful[main]  seq=0               examples/features.py:102
+  %1 = call sum_keys(('a',))      effectful[main]  seq=1  effect=[%0]  examples/features.py:102
+  %2 = op %0 + %1                                                      examples/features.py:102
   return %2

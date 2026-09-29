@@ -1,4 +1,4 @@
 graph domains #77095a7d ()
-  %0 = call kv_put('log', 1)  effectful[audit]  seq=0  features.py:150
-  %1 = call kv_put('k', 2)    effectful[main]  seq=1   features.py:151
+  %0 = call kv_put('log', 1)  effectful[audit]  seq=0  examples/features.py:150
+  %1 = call kv_put('k', 2)    effectful[main]  seq=1   examples/features.py:151
   return None

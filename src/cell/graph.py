@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import operator
+import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -83,7 +84,7 @@ class Node:
     path: list[int] = field(default_factory=list)
     effect: list[int] = field(default_factory=list)
     after: int | None = None
-    site: str | None = None  # file:line of the code that produced the node
+    site: str | None = None  # path:line of the code that produced the node
 
     @property
     def refs(self) -> list[int]:
@@ -138,10 +139,15 @@ class Graph:
 
     # Printing
 
-    def format(self) -> str:
-        """A readable listing (the basis of EXPLAIN)."""
+    def format(self, root: str | None = None) -> str:
+        """A readable listing (the basis of EXPLAIN).
+
+        Sites print relative to `root` (by default, the current directory)
+        for files under it, and as absolute paths otherwise.
+        """
+        root = os.getcwd() if root is None else root
         header = f"graph {_short(self.cell)} #{self.hash[:8]} ({', '.join(self.params)})"
-        rows = [_format_node(self, n) for n in self.nodes]
+        rows = [(lhs, tags, _relative(site, root)) for lhs, tags, site in (_format_node(self, n) for n in self.nodes)]
         w1 = max((len(r[0]) for r in rows), default=0)
         w2 = max((len(r[1]) for r in rows), default=0)
         lines = [header]
@@ -149,6 +155,13 @@ class Graph:
             line = f"  {lhs:<{w1}}  {tags:<{w2}}  {site}".rstrip()
             lines.append(line)
         return "\n".join(lines)
+
+
+def _relative(site: str, root: str) -> str:
+    if not site:
+        return site
+    prefix = os.path.join(os.path.abspath(root), "")
+    return site[len(prefix):] if site.startswith(prefix) else site
 
 
 def _short(qualified: str) -> str:

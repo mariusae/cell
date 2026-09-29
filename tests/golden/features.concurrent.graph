@@ -1,8 +1,8 @@
 graph concurrent #c136ed5a ()
-  %0 = call kv_get('a')  pure  seq=0  features.py:108
-  %1 = call kv_get('b')  pure  seq=1  features.py:108
-  %2 = call kv_get('a')  pure  seq=2  features.py:108
-  %3 = op 0 + %0                      features.py:109
-  %4 = op %3 + %1                     features.py:109
-  %5 = op %4 + %2                     features.py:109
+  %0 = call kv_get('a')  pure  seq=0  examples/features.py:108
+  %1 = call kv_get('b')  pure  seq=1  examples/features.py:108
+  %2 = call kv_get('a')  pure  seq=2  examples/features.py:108
+  %3 = op 0 + %0                      examples/features.py:109
+  %4 = op %3 + %1                     examples/features.py:109
+  %5 = op %4 + %2                     examples/features.py:109
   return %5

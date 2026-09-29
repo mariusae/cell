@@ -25,7 +25,8 @@ from examples import SCENARIOS
 from examples.features import kv_get, kv_put
 from examples.harness import Scenario, World
 
-GOLDEN = pathlib.Path(__file__).parent / "golden"
+ROOT = pathlib.Path(__file__).parent.parent
+GOLDEN = ROOT / "tests" / "golden"
 UPDATE = os.environ.get("CELL_UPDATE_GOLDEN") == "1"
 
 ids = [s.name for s in SCENARIOS]
@@ -50,7 +51,7 @@ def test_tracing_does_not_change_the_request(s: Scenario):
 def test_golden_graph(s: Scenario):
     traced, _ = run(s.trace())
     path = GOLDEN / (s.name.replace("/", ".") + ".graph")
-    text = traced.graph.format() + "\n"
+    text = traced.graph.format(root=str(ROOT)) + "\n"  # sites relative to the repo
     if UPDATE or not path.exists():
         path.parent.mkdir(exist_ok=True)
         path.write_text(text)

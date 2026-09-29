@@ -1,4 +1,4 @@
 graph pushdown_failure #eb11eea9 ()
-  %0 = call boom('value')                     pure  seq=0             features.py:134
-  %1 = call kv_put('y', %0)                   effectful[main]  seq=1  features.py:135
-  %2 = deopt: %1 failed while tracing (Boom)  path=[%1]               features.py:135
+  %0 = call boom('value')                     pure  seq=0             examples/features.py:134
+  %1 = call kv_put('y', %0)                   effectful[main]  seq=1  examples/features.py:135
+  %2 = deopt: %1 failed while tracing (Boom)  path=[%1]               examples/features.py:135
