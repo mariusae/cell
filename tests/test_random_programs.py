@@ -79,6 +79,7 @@ class Generator:
         self.vars = ["a", "b"]
         self.handles: list[str] = []
         self.n = 0
+        self.callee: str | None = None  # a composite cell the program may call
 
     def var(self) -> str:
         return self.rng.choice(self.vars)
@@ -120,6 +121,8 @@ class Generator:
             kinds += ["if", "if"]
         if self.rng.random() < 0.05:
             kinds.append("data_loop")
+        if self.callee is not None:
+            kinds += ["callee", "callee"] + (["callee_bg"] if top else [])
         kind = self.rng.choice(kinds)
         if kind == "get":
             e = self.expr()
@@ -166,6 +169,11 @@ class Generator:
             t = self.target(top)
             self.emit(indent, f"for _ in range({self.var()} % 3):")
             self.emit(indent + 1, f"{t} = await get(ctx, ({t} + 2) % 20)")
+        elif kind == "callee":
+            e1, e2 = self.expr(), self.expr()
+            self.emit(indent, f"{self.target(top)} = (await {self.callee}(ctx, {e1}, {e2}))[-1]")
+        elif kind == "callee_bg":
+            self.emit(indent, f"{self.callee}(ctx, {self.expr()}, {self.expr()})")
         elif kind == "if":
             self.emit(indent, f"if {self.expr()} > {self.expr()}:")
             self.block(indent + 1, depth + 1, self.rng.randrange(1, 3), False)
@@ -178,6 +186,19 @@ class Generator:
         self.block(1, 0, self.rng.randrange(3, 9), True)
         self.emit(1, "return (" + ", ".join(self.vars) + ",)")
         return "\n".join(self.lines) + "\n"
+
+
+def assert_effects_match(r, eager, world, eager_world, context=""):
+    """Every effect eager execution performs happens exactly once. Any other
+    effect must come from a call replay never reached, which domains permit
+    only when the cell failed (DESIGN §4.4)."""
+    ours = Counter(e.key() for e in world.effects)
+    theirs = Counter(e.key() for e in eager_world.effects)
+    assert not theirs - ours, context
+    extra = ours - theirs
+    ran_ahead = {j.path + (seq,) for j in r.journal.walk() for seq in j.unconsumed}
+    assert all(any(path[: len(p)] == p for p in ran_ahead) for path, _, _ in extra), context
+    assert not ran_ahead or r.error is not None, context
 
 
 def make(i: int):
@@ -210,7 +231,7 @@ def check(prog, graph, args, source, fail_at=None):
     context = f"\n{source}\nargs={args} fail_at={fail_at}\n{graph.format()}\n{r.journal.format()}"
     assert outcome_digest(r.outcome) == outcome_digest(expected.outcome), context
     assert r.journal.summary() == expected.journal.summary(), context
-    assert Counter(e.key() for e in w.effects) == Counter(e.key() for e in ew.effects), context
+    assert_effects_match(r, expected, w, ew, context)
     assert not Counter(ew.calls) - Counter(w.calls), context
     return r
 

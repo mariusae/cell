@@ -31,7 +31,7 @@ from . import data
 from .data import TreeDef
 from .semantics import UNIQUE
 
-KINDS = ("param", "call", "op", "pack", "source", "guard", "deopt", "return")
+KINDS = ("param", "call", "op", "pack", "source", "guard", "deopt", "return", "enter", "exit")
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,12 @@ class Node:
 
     @property
     def effectful(self) -> bool:
-        return self.kind == "call" and self.attrs["effectful"]
+        return self.kind in ("call", "enter") and self.attrs["effectful"]
+
+    @property
+    def scope(self) -> tuple[int, ...]:
+        """The call path, from the graph's root, of the invocation that issues this node."""
+        return tuple(self.attrs.get("scope", ()))
 
 
 @dataclass
@@ -178,17 +183,19 @@ def _format_node(g: Graph, n: Node) -> tuple[str, str, str]:
     tags: list[str] = []
     if n.kind == "param":
         body = f"param {a['name']}"
-    elif n.kind == "call":
-        body = f"call {_short(a['cell'])}({args})"
+    elif n.kind in ("call", "enter"):
+        body = f"{n.kind} {_short(a['cell'])}({args})"
         tags.append(f"effectful[{a['domain']}]" if a["effectful"] else "pure")
-        tags.append(f"seq={a['seq']}")
+        tags.append("seq=" + ".".join(str(s) for s in (*n.scope, a["seq"])))
+    elif n.kind == "exit":
+        body = f"exit {_short(a['cell'])} {args}"
     elif n.kind == "op":
         body = "op " + _format_op(n)
     elif n.kind == "pack":
         body = "pack " + _format_tree(a["tree"], iter(n.inputs))
     elif n.kind == "source":
         body = f"source {a['name']}({', '.join(repr(v) for v in a['args'].values())})"
-        tags.append(f"seq={a['seq']}")
+        tags.append("seq=" + ".".join(str(s) for s in (*n.scope, a["seq"])))
     elif n.kind == "guard":
         body = f"guard {_ref(n.inputs[0])} == {a['expected']!r}"
     elif n.kind == "deopt":
@@ -262,7 +269,7 @@ def _domain_from_json(j: Any) -> Any:
 
 def _attrs_to_json(kind: str, attrs: dict[str, Any]) -> dict[str, Any]:
     out = dict(attrs)
-    if kind == "call":
+    if kind in ("call", "enter"):
         out["domain"] = _domain_to_json(attrs["domain"])
     elif kind == "pack":
         out["tree"] = data.treedef_to_json(attrs["tree"])
@@ -275,7 +282,7 @@ def _attrs_to_json(kind: str, attrs: dict[str, Any]) -> dict[str, Any]:
 
 def _attrs_from_json(kind: str, j: dict[str, Any]) -> dict[str, Any]:
     out = dict(j)
-    if kind == "call":
+    if kind in ("call", "enter"):
         out["domain"] = _domain_from_json(j["domain"])
     elif kind == "pack":
         out["tree"] = data.treedef_from_json(j["tree"])

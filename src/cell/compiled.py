@@ -38,7 +38,7 @@ from . import data
 from .core import Cell, Op, find_cell, find_op
 from .errors import CellError
 from .graph import BUILTINS, Const, Graph, Input, Node
-from .journal import Ok
+from .journal import Entry, Ok
 
 if TYPE_CHECKING:
     from .context import Handle
@@ -75,7 +75,7 @@ def compile_graph(graph: Graph) -> Plan:
     ops: dict[int, Op] = {}
     for n in graph.nodes:
         a = n.attrs
-        if n.kind == "call":
+        if n.kind in ("call", "enter"):
             callee = find_cell(a["cell"], a["code"])
             if callee is None:
                 raise CompileError(f"%{n.id}: no loaded cell {a['cell']} with code {a['code']}")
@@ -111,8 +111,23 @@ class _Run:
         self.tasks: dict[asyncio.Task[Any], int] = {}
         self.result: Ok | None = None
         self.deopt: str | None = None
+        # Inlined callees (DESIGN §5.7): an invocation per scope, and the
+        # entry each one's call has in its parent's journal.
+        self.scopes: dict[tuple[int, ...], Invocation] = {(): inv}
+        self.entries: dict[tuple[int, ...], Entry] = {}
 
     async def run(self) -> Ok | Deopt:
+        try:
+            return await self._run()
+        finally:
+            for scope, sub in self.scopes.items():
+                if scope:
+                    # Calls inlined callees left in flight complete before the
+                    # invocation does, like the invocation's own.
+                    sub.finished = True
+                    self.inv.children.extend(sub.children)
+
+    async def _run(self) -> Ok | Deopt:
         while True:
             self._start_ready()
             if self.deopt is not None:
@@ -151,6 +166,11 @@ class _Run:
             return False
         if n.after is not None and n.after not in self.issued:
             return False
+        if n.kind == "exit":
+            # A callee completes only when everything it issued has.
+            scope = n.scope
+            if any(self.nodes[t].scope[: len(scope)] == scope for t in self.tasks.values()):
+                return False
         for i in n.inputs:
             if isinstance(i, int) and i not in self.done:
                 # A pure call can take an input call's handle before it completes.
@@ -183,7 +203,7 @@ class _Run:
             elif kind == "pack":
                 self._complete(n.id, data.unflatten(a["tree"], [self._value(i) for i in n.inputs]))
             elif kind == "source":
-                self._complete(n.id, self.inv.source(a["name"], a["args"], seq=a["seq"]))
+                self._complete(n.id, self.scopes[n.scope].source(a["name"], a["args"], seq=a["seq"]))
             elif kind == "guard":
                 value = self._value(n.inputs[0])
                 if data.digest(value) != data.digest(a["expected"]):
@@ -192,6 +212,10 @@ class _Run:
                     self._complete(n.id)
             elif kind == "call":
                 self._call(n)
+            elif kind == "enter":
+                self._enter(n)
+            elif kind == "exit":
+                self._exit(n)
             elif kind == "deopt":
                 self._fail(a["reason"])
             elif kind == "return":
@@ -221,9 +245,45 @@ class _Run:
                 arguments[param] = self.issued[i]  # pushdown: resolved before the callee starts
             else:
                 arguments[param] = self._value(i)
-        handle = self.inv.call(self.plan.cells[n.id], arguments, seq=a["seq"], domain=a["domain"])
+        inv = self.scopes[n.scope]
+        handle = inv.call(self.plan.cells[n.id], arguments, seq=a["seq"], domain=a["domain"])
         self.issued[n.id] = handle
         self.tasks[handle._task] = n.id
+
+    def _enter(self, n: Node) -> None:
+        """Issue an inlined call: an entry in the parent's journal, and the callee's invocation."""
+        a = n.attrs
+        parent = self.scopes[n.scope]
+        cell = self.plan.cells[n.id]
+        arguments = {p: self._value(i) for p, i in zip(a["params"], n.inputs)}
+        entry = Entry(seq=a["seq"], kind="call", target=cell.id, effectful=cell.effectful, domain=a["domain"])
+        entry.args = arguments
+        entry.args_digest = data.digest(arguments)
+        entry.started = True
+        parent.journal.entries.append(entry)
+        hit = parent.lookup(entry)  # when the parent is replaying, so does the callee
+        sub = type(parent)(
+            parent.runtime, cell, arguments, parent.journal.path + (a["seq"],), parent.journal.request_id,
+            hit.child if hit is not None else None, None,
+        )
+        sub.task = parent.task
+        sub.journal.mode = "compiled"
+        entry.child = sub.journal
+        scope = (*n.scope, a["seq"])
+        self.scopes[scope] = sub
+        self.entries[scope] = entry
+        self.issued[n.id] = None  # type: ignore[assignment]
+        self._complete(n.id)
+
+    def _exit(self, n: Node) -> None:
+        scope = n.scope
+        sub, entry = self.scopes[scope], self.entries[scope]
+        result = Ok(self._value(n.inputs[0]))
+        sub.journal.entries.sort(key=lambda e: e.seq)
+        sub.journal.outcome = result
+        sub.finished = True
+        entry.outcome = result
+        self._complete(n.id, result.value)
 
 
 def _short(cell_id: str) -> str:

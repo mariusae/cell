@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import itertools
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -186,6 +187,7 @@ class Runtime:
         resources: Mapping[Any, Any] | None = None,
         clock: Callable[[], float] | None = None,
         seed: int = 0,
+        cache: Mapping[Cell, float] | None = None,
     ):
         self.config = dict(config or {})
         data.check(self.config)
@@ -194,6 +196,36 @@ class Runtime:
         self.seed = seed
         self._request_ids = itertools.count(1)
         self._plans: dict[str, Plan] = {}
+        self._ttls: dict[str, float] = {}
+        self._cache: dict[tuple[str, str, str], tuple[Any, float]] = {}
+        self.cache_stats: Counter[str] = Counter()
+        for c, ttl in (cache or {}).items():
+            self.cache(c, ttl)
+
+    def cache(self, cell: Cell, ttl: float) -> None:
+        """Cache the results of calls to a pure cell for `ttl` seconds (NOTES §2).
+
+        Only pure cells can be cached: the policy is checked against the
+        cell's declared semantics. Errors are not cached.
+        """
+        if cell.effectful:
+            raise ValueError(f"{cell.id} is {cell.semantics!r}; only pure cells can be cached")
+        self._ttls[cell.id] = ttl
+
+    def _cached(self, cell: Cell, digest: str) -> tuple[bool, Any]:
+        ttl = self._ttls.get(cell.id)
+        if ttl is None:
+            return False, None
+        found = self._cache.get((cell.id, cell.code_hash, digest))
+        if found is not None and self.clock() - found[1] < ttl:
+            self.cache_stats["hit"] += 1
+            return True, found[0]
+        self.cache_stats["miss"] += 1
+        return False, None
+
+    def _store(self, cell: Cell, digest: str, outcome: Outcome) -> None:
+        if cell.id in self._ttls and isinstance(outcome, Ok):
+            self._cache[(cell.id, cell.code_hash, digest)] = (outcome.value, self.clock())
 
     def resource(self, key: Any) -> Any:
         try:
@@ -360,6 +392,12 @@ class Runtime:
             await asyncio.gather(*(h._task for h in inv.children), return_exceptions=True)
         if not inv.interrupted:
             inv.journal.outcome = _outcome(inv, result, body_error)
+        if inv.replay is not None:
+            inv.journal.unconsumed = [
+                e.seq
+                for e in inv.replay.entries
+                if e.seq not in inv.consumed and e.kind == "call" and e.effectful and e.started
+            ]
         return inv
 
     async def _run_call(self, parent: Invocation, entry: Entry, cell: Cell, arguments: dict[str, Any]) -> Any:
@@ -386,11 +424,21 @@ class Runtime:
         if hit is not None:
             entry.replayed = True
             entry.started = hit.started
+            entry.cached = hit.cached
             entry.child = hit.child
             if hit.outcome is not None:
                 return hit.outcome
             if hit.handle is None:
-                raise RuntimeError(f"journal entry {hit.key} has neither an outcome nor a handle")
+                # A call inlined into a compiled run that deopted before it
+                # finished: resume the callee from its partial journal.
+                entry.replayed = False
+                entry.started = True
+                inv = await self._invoke(
+                    cell, arguments, parent.journal.path + (entry.seq,), parent.journal.request_id, hit.child
+                )
+                entry.child = inv.journal
+                assert inv.journal.outcome is not None
+                return inv.journal.outcome
             # The call was still in flight when the journal was taken: wait for
             # it, then take its outcome and the callee's journal.
             try:
@@ -401,10 +449,17 @@ class Runtime:
             entry.child = hit.child
             return hit.outcome if hit.outcome is not None else outcome
 
+        hit_cache, value = self._cached(cell, entry.args_digest)
+        if hit_cache:
+            entry.started = True
+            entry.cached = True
+            return Ok(value)
+
         entry.started = True
         inv = await self._invoke(cell, arguments, parent.journal.path + (entry.seq,), parent.journal.request_id)
         entry.child = inv.journal
         assert inv.journal.outcome is not None
+        self._store(cell, entry.args_digest, inv.journal.outcome)
         return inv.journal.outcome
 
 

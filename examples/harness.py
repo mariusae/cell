@@ -48,9 +48,15 @@ class Effect:
 class World:
     """Fake services: tables, latency, and a log of calls and effects."""
 
-    def __init__(self, tables: Mapping[str, Mapping[Any, Any]] | None = None, latency: Mapping[str, float] | None = None):
+    def __init__(
+        self,
+        tables: Mapping[str, Mapping[Any, Any]] | None = None,
+        latency: Mapping[str, float] | None = None,
+        default_latency: float = 0.0,
+    ):
         self.tables: dict[str, dict[Any, Any]] = {name: dict(rows) for name, rows in (tables or {}).items()}
         self.latency = dict(latency or {})
+        self.default_latency = default_latency
         self.calls: list[Call] = []
         self.effects: list[Effect] = []
 
@@ -60,7 +66,7 @@ class World:
     async def enter(self, ctx: Ctx, name: str) -> World:
         """Record a leaf call and simulate its latency."""
         self.calls.append(Call(ctx.path, name))
-        delay = self.latency.get(name, 0.0)
+        delay = self.latency.get(name, self.default_latency)
         if delay:
             await asyncio.sleep(delay)
         return self

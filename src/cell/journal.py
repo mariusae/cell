@@ -70,6 +70,7 @@ class Entry:
     outcome: Outcome | None = None  # None while in flight
     awaited: bool = False
     replayed: bool = False  # the outcome came from a journal, not execution
+    cached: bool = False  # the outcome came from the runtime's cache (no child journal)
     child: Journal | None = None  # the callee's journal
     handle: Handle[Any] | None = field(default=None, repr=False)
 
@@ -101,6 +102,10 @@ class Journal:
     outcome: Outcome | None = None  # None if the invocation was interrupted
     mode: str = "eager"  # "eager", "compiled", or "deopt" (compiled, then replayed eagerly)
     deopt: str | None = None  # why a compiled run deopted
+    # Seqs of effectful calls in the journal this invocation replayed from
+    # that it never reached: effects in other domains that ran ahead of a
+    # failure (DESIGN §4.4).
+    unconsumed: list[int] = field(default_factory=list)
 
     def merged_over(self, base: Journal | None) -> Journal:
         """A journal with this one's entries, and base's for seqs this one lacks.
@@ -125,6 +130,31 @@ class Journal:
             if e.child is not None:
                 out.extend(e.child.walk())
         return out
+
+    def effects(self) -> tuple[Any, ...]:
+        """A comparable form of what matters to the outside: the outcome, and
+        every effectful call (recursively) with its arguments and outcome.
+
+        Optimized runs may issue fewer pure calls (deduplicated, cached) or
+        more (speculated) than eager execution, but must match it here.
+        """
+        return (
+            self.cell,
+            self.path,
+            outcome_digest(self.outcome),
+            tuple(
+                (
+                    e.seq,
+                    e.target,
+                    e.args_digest,
+                    e.started,
+                    outcome_digest(e.outcome),
+                    None if e.child is None else e.child.effects(),
+                )
+                for e in self.entries
+                if e.kind == "call" and e.effectful
+            ),
+        )
 
     def summary(self) -> tuple[Any, ...]:
         """A comparable form: equal for runs that did the same things with the same results."""
@@ -156,6 +186,8 @@ def _format_entry(e: Entry, indent: str) -> str:
         tags.append(f"effectful[{e.domain}]")
     if e.replayed:
         tags.append("replayed")
+    if e.cached:
+        tags.append("cached")
     if e.kind == "call" and not e.awaited:
         tags.append("unawaited")
     if e.kind == "call" and not e.started and e.outcome is not None:

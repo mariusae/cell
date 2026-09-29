@@ -223,7 +223,11 @@ difference.
 > Compiled(C, x, R) and Eager(C, x, R) produce the same result or error,
 > and the same *effectful* calls (cell and args), in orders consistent
 > with the ordering C's effect domains require (§4.4). Compiled may
-> additionally issue *pure* calls speculatively.
+> issue *pure* calls speculatively, and may issue fewer of them when
+> their results are shared (deduplicated, folded or cached, §10).
+
+`Journal.effects()` is the comparable form: the outcome, and every
+effectful call, recursively, with its arguments and outcome.
 
 With the default single domain, this is exactly eager's order. Declaring
 other domains relaxes the program's meaning, so eager's sequential order
@@ -702,12 +706,26 @@ composite cell is a black box in its parent's graph. At run time, the
 resolver decides independently whether the callee runs eagerly or
 compiled.
 
-**Inlining** (a later pass) replaces a `call` node with the callee's
-graph. Each inlined guard keeps a **deopt scope**: the call site it came
-from. If it fails, only that callee deopts. The callee replays eagerly
-from its own journal, and its result feeds back into the parent graph at
-the call site. So the unit of deopt is always the cell whose assumption
-failed.
+**Inlining** (`passes.inline`) replaces a `call` node to a cell with a
+complete graph by:
+
+- `enter`: issues the call in the parent's journal and starts the callee's
+  invocation, keeping the call's inputs and control edges;
+- the callee's nodes, with its parameters replaced by the call's inputs.
+  Each carries a `scope`: the call path of the invocation that issues it,
+  so the callee's calls are journaled under the callee, exactly as eager
+  would journal them. Everything that issues waits for `enter`;
+- `exit`: the callee's result, complete once the result is ready and
+  every call issued in the callee's scope has completed.
+
+Uses of the call's value become uses of `exit`; its `after` edges refer
+to `enter`. A cell is never inlined into itself.
+
+In v0 a deopt anywhere deopts the **whole invocation**, not only the
+callee. Replay then reaches the inlined call, finds its entry only partly
+done, and **resumes** the callee from its partial journal: calls it
+already issued are journal hits, so each happens once. Deopting only the
+callee (a deopt scope per call site) is a later refinement.
 
 ---
 
@@ -914,9 +932,25 @@ The v0 IR avoids decisions that would block these:
   own graph (endpoint projection). A data edge between partitions sends
   the value directly from producer to consumer, which is how handles
   passed through a caller (§1.5) avoid a round trip through it.
-- **Planner rewrites** as graph-to-graph passes: dedup of identical pure
-  calls, caching (wrap a pure call), dropping ordering edges between
-  commuting effectful calls, inlining.
+- **Planner rewrites** as graph-to-graph passes (`passes.py`):
+  - `inline` (§5.7);
+  - `fold`: builtin ops and packs on constants become constants, and
+    guards on constants that hold are dropped. After inlining, a callee's
+    guards often test the call's constant arguments. If one can never
+    hold, `optimize` leaves that call site un-inlined rather than build a
+    graph that always deopts;
+  - `dedup`: identical pure calls, ops, packs and guards share a node,
+    across inlined scopes too;
+  - `optimize` runs inline, fold, dedup.
+
+  Still to come: dropping ordering edges between commuting effectful
+  calls.
+- **Caching** is a runtime policy, not a graph rewrite: `Runtime(cache=
+  {cell: ttl})` caches results of calls to a cell, for any caller, eager
+  or compiled. Only pure cells may be cached: the policy is checked
+  against the declared semantics (NOTES §2). Errors aren't cached. A
+  cached call's journal entry is marked `cached` and has no child
+  journal, so replay reproduces it without the cache.
 - **EXPLAIN** is the printer in §4.6, plus annotations. **EXPLAIN
   ANALYZE** is the same view, overlaid with a trace's timings and
   outcomes.
@@ -998,6 +1032,27 @@ M2 is implemented in `src/cell/compiled.py` (the executor), the runtime
 `tests/test_random_programs.py` generates 60 programs from a small
 grammar (§9), traces each on several inputs, and runs every graph on
 every input, plus a deopt forced at each node, against eager execution.
+
+M4 is implemented in `src/cell/passes.py` (inline, fold, dedup), the
+executor (inlined scopes) and the runtime (caching, and resuming partly
+run callees on replay). `tests/test_passes.py` checks, by outcome and
+effects (§2):
+
+- every example graph, optimized, on every scenario of its cell, and with
+  a deopt forced at each node;
+- random programs that call a generated composite cell, with the callee
+  inlined and deopts forced throughout;
+- an inlined effectful callee interrupted by a deopt at each node, with
+  its effects happening exactly once;
+- caching: only pure cells, hits across requests, expiry, no cached
+  errors, replay of cached calls;
+- latency, in simulated time (`examples/simtime.py`, an event loop whose
+  clock jumps to the next timer): dataflow takes `home` from 50ms to
+  40ms, effect domains take `checkout` from 50ms to 30ms, and caching
+  leaves `home` with only its one effectful call (10ms).
+
+`uv run python -m examples --bench` prints eager, compiled and cached
+latency for every scenario.
 
 M3 is implemented in `src/cell/static.py` and `src/cell/monitor.py`.
 
@@ -1107,9 +1162,14 @@ can it be caught?
   This may argue for a way to declare invariants alongside cells.
 
 **v0 default.** Domains are declared and recorded (the `checkout`
-example uses them), but nothing reorders effects yet: the eager runtime
-runs them in program order, which is always allowed. Reordering across
-domains waits until there is a way to check the declarations.
+example uses them). The eager runtime runs effects in program order,
+which is always allowed. Compiled execution (M2) honors them: effects in
+different domains are not ordered, so they may overlap, and when a cell
+fails, an effect in another domain may already have run. Replay records
+such effects in `Journal.unconsumed`. This happens in the random program
+tests, which check that every extra effect is accounted for this way.
+Whether compiled execution should instead wait for a way to check
+domain declarations is still open.
 
 ### 13.4 How far pushdown goes
 

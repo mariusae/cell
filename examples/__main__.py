@@ -3,6 +3,7 @@
     uv run python -m examples                  # all scenarios
     uv run python -m examples home             # scenarios whose name contains "home"
     uv run python -m examples --graphs home    # the graphs traced from them
+    uv run python -m examples --bench          # latency: eager, compiled, cached
 """
 
 import asyncio
@@ -28,6 +29,11 @@ async def main(pattern: str, graphs: bool) -> None:
 
 
 if __name__ == "__main__":
+    if "--bench" in sys.argv:
+        from .bench import main as bench
+
+        bench()
+        sys.exit()
     args = sys.argv[1:]
     graphs = "--graphs" in args
     args = [a for a in args if a != "--graphs"]
