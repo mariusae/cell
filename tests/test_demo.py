@@ -95,3 +95,33 @@ def test_batching_wins_under_contention():
     assert batched["p50"] < plain["p50"] / 1.5
     assert batched["throughput"] > plain["throughput"] * 1.5
     assert batched["calls_per_request"] < plain["calls_per_request"]
+
+
+def _home(clients):
+    from demo import sim
+    from demo.app import _graphs
+    from examples import scenario
+    from examples.bench import PROFILES
+
+    s = scenario("home/premium")
+    _, graph = _graphs(s, s, True, True, True)
+    settings = sim.Settings(requests=300, clients=clients, capacity=8)
+    medians = PROFILES["examples.home"]
+    variants = [sim.Variant("eager"), sim.Variant("compiled", graph), sim.Variant("batched", graph, (), (16, 0.002))]
+    return [sim.run(s, v, settings, medians).summarize() for v in variants]
+
+
+def test_compiled_home_is_faster_at_light_load():
+    """Each call's latency is the same in every variant (common random numbers),
+    so the comparison shows the plan, not sampling noise: get_items starts at once."""
+    eager, compiled, _ = _home(clients=8)
+    assert compiled["p50"] < eager["p50"] - 5
+    assert compiled["throughput"] > eager["throughput"]
+
+
+def test_batching_home_wins_under_contention():
+    """get_items is the bottleneck (30ms, 8 at a time); batched, one call serves many requests."""
+    eager, compiled, batched = _home(clients=32)
+    assert abs(compiled["throughput"] - eager["throughput"]) < 10  # saturated at get_items either way
+    assert batched["throughput"] > 2 * compiled["throughput"]
+    assert batched["p50"] < compiled["p50"] / 2

@@ -64,8 +64,39 @@ async def get_items(ctx, uid: int) -> tuple[Item, ...]:
 @cell(pure)
 async def rank(ctx, items: tuple[Item, ...], prefs: Prefs) -> tuple[Item, ...]:
     await service(ctx, "rank")
+    return _rank(items, prefs)
+
+
+def _rank(items: tuple[Item, ...], prefs: Prefs) -> tuple[Item, ...]:
     boost = lambda i: 1.0 if i.category == prefs.boost else 0.0
     return tuple(sorted(items, key=lambda i: (-(i.score + boost(i)), i.id)))
+
+
+# Vector forms: a multi-get for users and for items, and ranking in a batch.
+# A single request makes one call to each, so there is nothing to share
+# within a request; across the requests of a batch, there is (DESIGN §10).
+# get_prefs is declared effectful, so it has none and stays per request.
+
+
+@get_user.vectorized
+async def get_users(ctx, uid: list[int]) -> list[User]:
+    w = await service(ctx, "get_users", len(uid))
+    missing = [u for u in uid if u not in w.table("users")]
+    if missing:
+        raise NotFound(f"users {missing}")  # the runtime retries one by one to attribute it
+    return [w.table("users")[u] for u in uid]
+
+
+@get_items.vectorized
+async def get_items_many(ctx, uid: list[int]) -> list[tuple[Item, ...]]:
+    w = await service(ctx, "get_items_many", len(uid))
+    return [w.table("items").get(u, ()) for u in uid]
+
+
+@rank.vectorized
+async def rank_many(ctx, items: list[tuple[Item, ...]], prefs: list[Prefs]) -> list[tuple[Item, ...]]:
+    await service(ctx, "rank_many", len(items))
+    return [_rank(i, p) for i, p in zip(items, prefs)]
 
 
 @op

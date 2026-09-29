@@ -24,7 +24,7 @@ from .harness import Scenario, World
 
 DEFAULT_LATENCY = 0.010
 PROFILES: dict[str, dict[str, float]] = {
-    "examples.home": {"get_items": 0.030},  # a slow candidate source
+    "examples.home": {"get_items": 0.030, "get_items_many": 0.030},  # a slow candidate source
     # Scoring features is the expensive service (model inference); marking
     # posts seen is a cheap write.
     "examples.feed": {"features": 0.030, "features_many": 0.030, "mark_seen": 0.005},

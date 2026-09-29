@@ -1,12 +1,12 @@
 graph home_pushdown #9856780a (uid)
   %0 = param uid
-  %1 = call get_user(%0)              pure  seq=0             examples/home.py:91
-  %2 = op %1.id                                               examples/home.py:92
-  %3 = call get_prefs(%2)             effectful[main]  seq=1  examples/home.py:92
-  %4 = call get_items(%0)             pure  seq=2             examples/home.py:93
-  %5 = op %1.tier                                             examples/home.py:94
-  %6 = op %5 == 'premium'                                     examples/home.py:94
-  %7 = guard %6 == False                                      examples/home.py:94
-  %8 = op greeting(%1)                                        examples/home.py:98
+  %1 = call get_user(%0)              pure  seq=0             examples/home.py:122
+  %2 = op %1.id                                               examples/home.py:123
+  %3 = call get_prefs(%2)             effectful[main]  seq=1  examples/home.py:123
+  %4 = call get_items(%0)             pure  seq=2             examples/home.py:124
+  %5 = op %1.tier                                             examples/home.py:125
+  %6 = op %5 == 'premium'                                     examples/home.py:125
+  %7 = guard %6 == False                                      examples/home.py:125
+  %8 = op greeting(%1)                                        examples/home.py:129
   %9 = pack Page(title=%8, items=%4)
   return %9

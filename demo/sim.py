@@ -50,13 +50,20 @@ class Services:
         self.elements: Counter[str] = Counter()
         self._slots: dict[str, asyncio.Semaphore] = {}
 
-    async def serve(self, name: str, n: int = 1) -> None:
+    async def serve(self, name: str, n: int = 1, key: str = "") -> None:
         """One call, serving n elements if it's a vector call. It takes one slot,
-        and costs a little more per element (examples.harness.BATCH_COST)."""
+        and costs a little more per element (examples.harness.BATCH_COST).
+
+        The latency is drawn from a generator seeded by `key`, which names the
+        call (its request, path and service). The same call then takes the same
+        time in every variant, whatever order calls happen in: comparisons
+        between variants aren't noise from drawing different samples.
+        """
         self.calls[name] += 1
         self.elements[name] += n
         median = self.medians.get(name, self.settings.median_ms / 1000)
-        latency = median * math.exp(self.rng.gauss(0.0, self.settings.sigma)) * (1 + BATCH_COST * (n - 1))
+        rng = random.Random(f"{self.settings.seed}|{key or name}|{self.calls[name] if not key else ''}")
+        latency = median * math.exp(rng.gauss(0.0, self.settings.sigma)) * (1 + BATCH_COST * (n - 1))
         slots = self._slots.setdefault(name, asyncio.Semaphore(self.settings.capacity))
         async with slots:
             await asyncio.sleep(latency)
@@ -72,7 +79,7 @@ class SimWorld:
         self.views: dict[str, World] = {}
 
     async def enter(self, ctx: Any, name: str, n: int = 1) -> World:
-        await self.services.serve(name, n)
+        await self.services.serve(name, n, key=f"{ctx.request_id}|{ctx.path}|{name}")
         # Vector calls serve many requests: they read a shared copy.
         key = "vector" if ctx.request_id.startswith("vector-") else ctx.request_id
         view = self.views.get(key)
