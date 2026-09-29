@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cell import Cell, Ctx, Run, Runtime
+from cell.trace import Traced, trace
 
 NOW = 1_000_000.0
 """The fixed clock scenarios run with."""
@@ -104,6 +105,11 @@ class Scenario:
         world = world or self.world()
         run = await self.runtime(world).execute(self.cell, self.args, self.kwargs, request_id="req", **options)
         return run, world
+
+    async def trace(self, world: World | None = None, **options: Any) -> tuple[Traced, World]:
+        world = world or self.world()
+        traced = await trace(self.runtime(world), self.cell, self.args, self.kwargs, request_id="req", **options)
+        return traced, world
 
     def __repr__(self) -> str:
         return f"<scenario {self.name}>"

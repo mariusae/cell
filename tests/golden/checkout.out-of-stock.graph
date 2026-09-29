@@ -1,0 +1,8 @@
+graph checkout #c5cc1208 (order)
+  %0 = param order
+  %1 = op %0.id                                                                        checkout.py:88
+  %2 = call audit('attempt', %1)                    effectful[audit]  seq=0            checkout.py:88
+  %3 = op %0.sku                                                                       checkout.py:89
+  %4 = op %0.qty                                                                       checkout.py:89
+  %5 = call reserve(%3, %4)                         effectful[main]  seq=1  path=[%1]  checkout.py:89
+  %6 = deopt: %5 failed while tracing (OutOfStock)  path=[%2, %5]                      checkout.py:89

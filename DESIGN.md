@@ -1,4 +1,6 @@
-# Cells: graph and tracing design
+# Cell
+
+Cell is an experimental online serving system.
 
 Status: draft proposal. Background and motivation are in
 [NOTES.md](NOTES.md).
@@ -67,6 +69,8 @@ async def home(ctx, uid: int) -> Page:
   only one distinction: **pure** vs. **effectful**. Undeclared cells are
   effectful (`external`). The richer vocabulary (reads/writes, idempotent,
   compensable, vector forms) attaches to the same declaration later.
+- A cell annotated `-> None` must return None; the runtime enforces it.
+  The tracer relies on it: the result of such a call needs no guard.
 
 ### 1.2 Data
 
@@ -283,34 +287,36 @@ program order.
 
 ```
 Graph
-  cell:      CellRef             # cell id + code hash
-  params:    [ValueId]           # one per cell parameter (excluding ctx)
-  nodes:     [Node]              # topological, program order
-  result:    ValueId
-  guards:    [NodeId]            # index of guard/deopt nodes
-  meta:      trace ids, counts, source file hashes
+  cell:      str                 # cell id
+  code:      str                 # the cell's code hash
+  params:    [str]               # parameter names (excluding ctx)
+  nodes:     [Node]              # topological, program order; ends in return or deopt
 
 Node
-  id:        NodeId              # also its ValueId, if it produces a value
-  kind:      param | const | call | op | pack | source | guard | deopt | return
-  inputs:    [ValueId]           # data dependencies
-  path:      [NodeId]            # path edges (§4.3)
-  effect:    [NodeId]            # effect edges, within a domain (§4.3, §4.4)
+  id:        int                 # also its value's id, if it produces one
+  kind:      param | call | op | pack | source | guard | deopt | return
+  inputs:    [int | Const]       # data dependencies, or constants
   attrs:     kind-specific
+  path:      [int]               # path edges (§4.3)
+  effect:    [int]               # effect edges: completion, same domain (§4.3, §4.4)
+  after:     int | None          # issue-order edge: previous effect, same domain
   site:      file:line           # for EXPLAIN and diagnostics
 ```
+
+Constants are operands, not nodes: they print inline (`%5 == 'premium'`)
+and don't need ids. A node's value is its result; `refs` (data inputs,
+`path` and `effect`) are the nodes that must complete successfully first.
 
 ### 4.2 Node kinds
 
 | Kind | Inputs | Attrs | Meaning |
 |---|---|---|---|
-| `param` | — | index, type | A cell input |
-| `const` | — | value (data) | A literal or a captured constant |
+| `param` | — | name, index | A cell input |
 | `call` | args (one per parameter) | cell ref, semantics (pure/effectful), effect domain, `seq` | Issue a call to a cell |
-| `op` | args | op ref (name + code hash), or a builtin (§5.2) | Pure local computation |
+| `op` | args | op ref (id + code hash), or a builtin name (§5.2) | Pure local computation |
 | `pack` | leaves | treedef (structure) | Build a data value from its leaves |
 | `source` | — | `now` \| `random` \| `config(key)` | Nondeterminism through ctx; journaled |
-| `guard` | pred value | expected value | Assert pred == expected, otherwise deopt |
+| `guard` | value | expected value | Assert value == expected, otherwise deopt |
 | `deopt` | — | reason | Unconditional deopt: a graph break (§6.2) |
 | `return` | value | — | Result of the cell |
 
@@ -323,7 +329,7 @@ with a subgraph), `switch`/`merge` (trace trees), `send`/`recv`
 Data edges alone would allow any reordering. That is fine for pure nodes
 and wrong for effectful ones. The rules:
 
-- **Pure nodes** (`const`, `op`, `pack`, pure `call`, `param`) are ordered
+- **Pure nodes** (`param`, `op`, `pack`, pure `call`) are ordered
   only by data edges. They may run earlier than in eager, including
   speculatively before a guard that precedes them in program order. The
   cost of a failed speculation is only wasted work.
@@ -341,12 +347,13 @@ and wrong for effectful ones. The rules:
     if the values that led to it were computed without error. **Path
     edges are never relaxed.**
   - **Effect edges** go to other effectful calls *in the same effect
-    domain* (§4.4):
-    - to the *issue* of the previous effect in the domain, so effects in
-      a domain are issued in program order, and
-    - to the *completion* of every observed effect in the domain, so an
-      effect proceeds only if the earlier ones it waited for in eager
-      succeeded.
+    domain* (§4.4). There are two kinds:
+    - `effect`: the *completion* of every observed effect in the domain,
+      so an effect proceeds only if the earlier ones it waited for in
+      eager succeeded;
+    - `after`: the *issue* of the previous effect in the domain, so
+      effects in a domain are issued in program order even when nothing
+      waited for them.
 
   With the default single domain (`main`), this is exactly eager's
   behavior: an effect runs only if everything before it succeeded and
@@ -359,6 +366,14 @@ control dependencies, because eager doesn't wait for them either.
 Data edges always apply, whatever the domains. If an effect uses another
 effect's result, or code branches on it, the data edge or the guard's
 path edge orders them.
+
+**Implied edges are left out.** A node's successful completion implies
+that of everything it depends on through data, `path` and `effect`
+edges. So an edge to X is omitted when X is already implied by the node's
+other edges, or by another edge in the same list; `after` is omitted when
+the previous effect's completion is already implied. For example,
+`get_prefs(user.id)` needs no path edge to `get_user`: it already depends
+on it through `user.id`.
 
 ### 4.4 Effect domains
 
@@ -478,28 +493,32 @@ Traced on a premium user (`get_user`, `get_items` and `rank` are pure;
 `get_prefs` is effectful):
 
 ```
-graph home #3f2a9c  (uid: int) -> Page
-  %0  = param 0 : int
-  %1  = call get_user(%0)            pure        seq=0   home.py:14
-  %2  = op getattr(%1, "id")                             home.py:15
-  %3  = call get_prefs(%2)           effectful   seq=1   home.py:15  path=[%1]
-  %4  = call get_items(%0)           pure        seq=2   home.py:16
-  %5  = op getattr(%1, "tier")                           home.py:17
-  %6  = op eq(%5, "premium")                             home.py:17
-  %7  = guard %6 == True                                 home.py:17
-  %8  = call rank(%4, %3)            pure        seq=3   home.py:18
-  %9  = op greeting(%1)                                  home.py:21
-  %10 = pack Page(title=%9, items=%8)                    home.py:21
+graph home #605d3784 (uid)
+  %0 = param uid
+  %1 = call get_user(%0)               pure  seq=0             home.py:78
+  %2 = op %1.id                                                home.py:79
+  %3 = call get_prefs(%2)              effectful[main]  seq=1  home.py:79
+  %4 = call get_items(%0)              pure  seq=2             home.py:80
+  %5 = op %1.tier                                              home.py:81
+  %6 = op %5 == 'premium'                                      home.py:81
+  %7 = guard %6 == True                                        home.py:81
+  %8 = call rank(%4, %3)               pure  seq=3             home.py:82
+  %9 = op greeting(%1)                                         home.py:85
+  %10 = pack Page(title=%9, items=%8)
   return %10
 ```
+
+This is the actual output of the tracer, from `examples/home.py`. The
+graph of every example scenario is in `tests/golden/`.
 
 Things to notice:
 
 - **`get_items` doesn't depend on `get_user`.** Program order serialized
   them; the graph doesn't, so compiled mode runs them in parallel. This is
   the first optimization tracing gives us for free.
-- **`get_prefs` has `path=[%1]`.** Eager only reaches it after
-  `await get_user` has succeeded.
+- **`get_prefs` needs no path edge.** Eager only reaches it after
+  `await get_user` has succeeded, but it depends on `get_user` through
+  `%2` already.
 - **`rank` can start speculatively before `%7` is checked,** because it
   is pure.
 - **The trace is specialized to the premium branch.** A non-premium user
@@ -544,12 +563,15 @@ In trace mode `ctx` is a `TracingCtx`. It:
 | `[i]`, `[k]` | `op getitem` | |
 | `+ - * / // % == != < <= > >= & \| ^ ~ -x` | `op <operator>` | Comparison results are tracers too |
 | Pure methods on immutable builtins (`str.lower`, `tuple.index`, …) | `op method` | From a fixed allowlist |
-| `bool(t)`, `if t:`, `and`/`or`/`not` | `guard` on truthiness | Concretizes the value (§5.4) |
+| `bool(t)`, `if t:`, `and`/`or`/`not` | `op truth` + `guard` on the result | Concretizes the value (§5.4) |
 | `len(t)` | `op len` + `guard` on the result | Python requires `len` to return an int |
-| `iter(t)`, `for x in t` | `guard` on length, then one `getitem` per element | Unrolled. Use `ctx.map` for data-dependent fan-out (§10) |
-| `int(t)`, `float(t)`, `hash(t)`, `str(t)`, `format(t)`, … | **graph break** | A guard on the exact value would almost never hold, so break instead |
+| `iter(t)`, `for x in t` | `guard` on length, then one `getitem` per element | Tuples and lists only. Unrolled. Use `ctx.map` for data-dependent fan-out (§10) |
+| A value that is None, a bool or an Enum member | Returned concretely, with a `guard` on its value | Code compares these with `is`, which a tracer can't intercept |
+| `int(t)`, `float(t)`, `hash(t)`, `str(t)`, `repr(t)`, `format(t)`, … | **graph break** | A guard on the exact value would almost never hold, so break instead |
+| `isinstance(t, C)`, `t.__class__` | **graph break** | The type of a value is data-dependent too (§5.4) |
 | Mutation (`setattr`, `setitem`, `append`, …) | **graph break** | Data is immutable |
-| Passing to any other callable | **graph break** (§5.4) | |
+| An op or builtin that raises while tracing | **graph break** | Replay raises it in eager mode, where user code may handle it |
+| Passing to any other callable | **graph break** (§5.4) | Not yet enforced; see §5.4, defense 3 |
 
 ### 5.3 Pytrees
 
@@ -557,8 +579,9 @@ When a structure containing tracers is passed to a call or an op, or
 returned from the cell, the tracer:
 
 1. flattens it into leaves and a treedef (the structure),
-2. turns concrete leaves into `const` nodes, and
-3. emits a `pack` node.
+2. makes concrete leaves constant operands, and
+3. emits a `pack` node. Identical packs (the same structure and operands)
+   share a node, so a value used twice is packed once.
 
 User code builds values the ordinary way (`Page(title=t, items=u)`), and
 the graph gets a `pack`. Construction runs the dataclass's
@@ -579,11 +602,15 @@ graph. Defenses, in order:
    dunders (`__bool__`, `__len__`, `__iter__`, `__index__`, `__hash__`,
    `__str__`, …) either record a guard or trigger a graph break. None
    returns a concrete value without recording. Guards are limited to
-   booleans and lengths; anything else breaks.
-2. **Tracers are opaque.** A tracer is not a subclass of the wrapped type
-   and does not spoof `__class__`. Code that checks
-   `isinstance(t, dict)` sees False; it will usually fail fast rather than
-   take a silently wrong path.
+   booleans, lengths, and values that are None, bools or Enum members;
+   anything else breaks.
+2. **Tracers are opaque, and type tests break.** A tracer is not a
+   subclass of the wrapped type. `isinstance` consults `__class__` when
+   the type doesn't match, so a tracer's `__class__` is a property that
+   breaks: a type test never silently answers False. `type(t)` can't be
+   intercepted, and neither can `is` on values other than None, bools and
+   Enum members (which are never tracers, see §5.2). Those are left to
+   defenses 3, 5 and 6.
 3. **Calls from cell frames are checked.** During tracing, `sys.monitoring`
    (PEP 669) watches calls made from traced frames: the cell body and any
    plain helpers it calls. If a tracer is passed to anything that is not a
@@ -604,12 +631,21 @@ graph. Defenses, in order:
 Defenses 1–4 make the tracer strict; 5 makes the system safe even when
 strictness has a hole.
 
+M1 implements defenses 1, 2 and 4. Until defense 3 exists, one hole is
+known: a tracer passed to library code that raises (for example
+`", ".join(names)` with traced names raises `TypeError`), where user code
+catches the error with `except Exception`, takes the except branch
+silently. `GraphBreak` itself is a `BaseException`, so `except Exception`
+never swallows a break.
+
 ### 5.5 Breaks during tracing
 
 When the tracer hits a break at some point P in the trace:
 
 1. **Stop recording.** Everything recorded before P stays in the graph.
-   Append a `deopt` node with the reason and source location.
+   Append a `deopt` node with the reason and source location. The
+   invocation is stopped too: it refuses any further calls, even from
+   `finally` blocks or code that catches the break.
 2. **Finish the request correctly.** The traced request is a real
    request and must still complete. Raise an internal `GraphBreak`, abort
    the body, and re-run the cell eagerly **with replay from the trace's
@@ -629,15 +665,21 @@ When the tracer hits a break at some point P in the trace:
   fails in compiled mode, that's a deopt: eager replay re-raises the
   journaled error at the `await`, and the user's `try/except` handles it.
   The graph doesn't model exception control flow.
-- **User code catching an error during tracing** (a `try/except` around a
-  failing call) means the trace saw error handling. That's a graph break
-  at the `await`.
-- **Errors raised by ops** in compiled mode also deopt. Replay raises the
-  same error from the op, because ops are deterministic.
+- **A call that fails while tracing** is a graph break at its `await`,
+  whether or not user code would catch the error. Replay re-raises it
+  there, and the user's `try/except` handles it eagerly.
+- **An exception that escapes the body while tracing** is a break too.
+  The tracer can't tell a genuine error from one caused by a tracer
+  reaching code that can't handle it, so it lets replay produce the true
+  outcome.
+- **Errors raised by ops** also deopt in compiled mode. Replay raises the
+  same error from the op, because ops are deterministic. While tracing,
+  an op that raises is a break.
 
 ### 5.7 Nested cells and inlining
 
-Each cell is traced separately and gets its own graphs. A `call` to a
+Each cell is traced separately and gets its own graphs. Tracing a request
+traces only its root cell; the cells it calls run eagerly. A `call` to a
 composite cell is a black box in its parent's graph. At run time, the
 resolver decides independently whether the callee runs eagerly or
 compiled.
@@ -655,10 +697,11 @@ failed.
 
 ### 6.1 Guards
 
-A `guard` checks that a predicate matches the value observed during
-tracing. In v0 the predicate is either the truthiness of a value or a
-length. It runs as soon as its input is ready, which is often before the
-Python program would have reached it.
+A `guard` checks that a value equals the one observed during tracing.
+In v0 the value is a bool (from `op truth` or a comparison), a length
+(from `op len`), or a None, bool or Enum value user code saw concretely.
+It runs as soon as its input is ready, which is often before the Python
+program would have reached it.
 
 ### 6.2 Graph breaks
 
@@ -798,7 +841,7 @@ The v0 IR avoids decisions that would block these:
 
 - **vmap.** Every node kind needs a *batching rule*:
   - `param`: becomes a vector.
-  - `const`: broadcast.
+  - constant operands: broadcast.
   - `op`: maps over the vector, or uses a declared vector form.
   - `pack`: element-wise.
   - `call`: uses the declared vector form, or falls back to batching.
@@ -869,6 +912,19 @@ ways:
 
 Later milestones add checks to the same scenarios, for example that
 compiled execution matches eager.
+
+M1 is implemented in `src/cell/graph.py` and `src/cell/trace.py`.
+`tests/test_trace.py` checks every scenario:
+
+- **tracing doesn't change the request:** the outcome and journal match
+  eager execution, and every leaf call and effect happens exactly once,
+  including when the trace breaks;
+- **golden graphs:** each scenario's graph matches `tests/golden/`;
+- **invariants:** topological order, edges only where §4.3 allows them,
+  call and source `seq`s matching the journal;
+- **JSON round-trips** preserve the graph and its hash.
+
+Targeted tests cover each rule of §5.2 and the edges of §4.3–4.4.
 
 ---
 

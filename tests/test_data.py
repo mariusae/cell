@@ -1,11 +1,12 @@
 import dataclasses
 import enum
+import json
 from typing import NamedTuple
 
 import pytest
 
 from cell import DataError
-from cell.data import check, digest, encode, flatten, unflatten
+from cell.data import check, digest, encode, flatten, from_json, to_json, unflatten
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,3 +110,20 @@ def test_encode_is_stable():
     assert encode({"b": [1, 2.5], "a": Point(1, 0.5)}) == (
         'd{"a":ctest_data.Point(x=i1,y=f0.5),"b":l[i1,f2.5]}'
     )
+
+
+@pytest.mark.parametrize("value", VALUES + [float("inf"), {"$tuple": [1]}], ids=repr)
+def test_json_roundtrip(value):
+    j = json.loads(json.dumps(to_json(value)))
+    back = from_json(j)
+    assert back == value
+    assert digest(back) == digest(value)
+
+
+def test_local_types_cannot_be_loaded():
+    @dataclasses.dataclass(frozen=True)
+    class Local:
+        x: int
+
+    with pytest.raises(DataError):
+        from_json(to_json(Local(1)))

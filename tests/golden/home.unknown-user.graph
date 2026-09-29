@@ -1,0 +1,4 @@
+graph home #067f1098 (uid)
+  %0 = param uid
+  %1 = call get_user(%0)                          pure  seq=0  home.py:78
+  %2 = deopt: %1 failed while tracing (NotFound)  path=[%1]    home.py:78

@@ -1,0 +1,3 @@
+graph unawaited_write_fails #061d26de ()
+  %0 = call boom_write('write')  effectful[main]  seq=0  features.py:72
+  return 1

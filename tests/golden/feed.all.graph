@@ -1,0 +1,40 @@
+graph feed #00cc8f33 (uid, k)
+  %0 = param uid
+  %1 = param k
+  %2 = source now()                                seq=0                                                  feed.py:75
+  %3 = call following(%0)                          pure  seq=1                                            feed.py:76
+  %4 = op len(%3)                                                                                         feed.py:77
+  %5 = guard %4 == 2                                                                                      feed.py:77
+  %6 = op %3[0]                                                                                           feed.py:77
+  %7 = call recent_posts(%6)                       pure  seq=2                                            feed.py:77
+  %8 = op %3[1]                                                                                           feed.py:77
+  %9 = call recent_posts(%8)                       pure  seq=3                                            feed.py:77
+  %10 = op len(%7)                                                                                        feed.py:78
+  %11 = guard %10 == 2                                                                                    feed.py:78
+  %12 = op %7[0]                                                                                          feed.py:78
+  %13 = op %7[1]                                                                                          feed.py:78
+  %14 = op len(%9)                                                                                        feed.py:78
+  %15 = guard %14 == 1                                                                                    feed.py:78
+  %16 = op %9[0]                                                                                          feed.py:78
+  %17 = call features(%0, %12)                     pure  seq=4                                            feed.py:79
+  %18 = call features(%0, %13)                     pure  seq=5                                            feed.py:79
+  %19 = call features(%0, %16)                     pure  seq=6                                            feed.py:79
+  %20 = op score(%12, %17, %2)                                                                            feed.py:80
+  %21 = op score(%13, %18, %2)                                                                            feed.py:80
+  %22 = op score(%16, %19, %2)                                                                            feed.py:80
+  %23 = pack ((%12, %20), (%13, %21), (%16, %22))                                                         feed.py:81
+  %24 = op top_k(%23, %1)                                                                                 feed.py:81
+  %25 = op truth(%24)                                                                                     feed.py:82
+  %26 = guard %25 == True                                                                                 feed.py:82
+  %27 = op len(%24)                                                                                       feed.py:83
+  %28 = guard %27 == 3                                                                                    feed.py:83
+  %29 = op %24[0]                                                                                         feed.py:83
+  %30 = op %29.id                                                                                         feed.py:83
+  %31 = op %24[1]                                                                                         feed.py:83
+  %32 = op %31.id                                                                                         feed.py:83
+  %33 = op %24[2]                                                                                         feed.py:83
+  %34 = op %33.id                                                                                         feed.py:83
+  %35 = pack (%30, %32, %34)                                                                              feed.py:83
+  %36 = call mark_seen(%0, %35)                    effectful[main]  seq=7  path=[%5, %11, %15, %26, %28]  feed.py:83
+  %37 = pack Feed(user=%0, posts=%24)
+  return %37

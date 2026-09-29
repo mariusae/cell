@@ -1,0 +1,3 @@
+graph unawaited_read_fails #e3e1e385 ()
+  %0 = call boom('read')  pure  seq=0  features.py:79
+  return 1

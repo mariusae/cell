@@ -15,7 +15,9 @@ from __future__ import annotations
 import dataclasses
 import enum
 import hashlib
+import importlib
 import json
+import math
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -62,7 +64,8 @@ def flatten(
 
 
 def _flatten(value: Any, leaves: list[Any], is_leaf: Callable[[Any], bool] | None) -> TreeDef:
-    if is_primitive(value) or (is_leaf is not None and is_leaf(value)):
+    # is_leaf goes first: the tracer's values must not reach isinstance.
+    if (is_leaf is not None and is_leaf(value)) or is_primitive(value):
         leaves.append(value)
         return LEAF
     t = type(value)
@@ -190,3 +193,107 @@ def digest(value: Any) -> str:
 
 def _qualname(t: type) -> str:
     return f"{t.__module__}.{t.__qualname__}"
+
+
+# Serialization.
+
+
+def to_json(value: Any) -> Any:
+    """A JSON-compatible form of a data value, which `from_json` reverses.
+
+    Lists, str-keyed dicts' contents, str, int, float, bool and None map to
+    themselves; everything else is tagged with a "$" key. Types are named by
+    `module:qualname`, so they must be importable to be loaded again.
+    """
+    leaves, tree = flatten(value)
+    return _to_json(tree, iter(leaves))
+
+
+def _to_json(tree: TreeDef, it: Iterator[Any]) -> Any:
+    kind = tree.kind
+    if kind == "leaf":
+        return _leaf_to_json(next(it))
+    children = [_to_json(c, it) for c in tree.children]
+    if kind == "tuple":
+        return {"$tuple": children}
+    if kind == "list":
+        return children
+    if kind == "dict":
+        return {"$dict": dict(zip(tree.keys, children))}
+    if kind == "namedtuple":
+        return {"$namedtuple": type_name(tree.type), "items": children}  # type: ignore[arg-type]
+    if kind == "dataclass":
+        return {"$dataclass": type_name(tree.type), "fields": dict(zip(tree.keys, children))}  # type: ignore[arg-type]
+    raise AssertionError(kind)
+
+
+def _leaf_to_json(v: Any) -> Any:
+    if isinstance(v, enum.Enum):
+        return {"$enum": type_name(type(v)), "name": v.name}
+    if isinstance(v, float) and not math.isfinite(v):
+        return {"$float": repr(v)}
+    if isinstance(v, bytes):
+        return {"$bytes": v.hex()}
+    return v  # None, bool, int, float, str
+
+
+def from_json(j: Any) -> Any:
+    """The data value `to_json` produced `j` from."""
+    if j is None or isinstance(j, (bool, int, float, str)):
+        return j
+    if isinstance(j, list):
+        return [from_json(x) for x in j]
+    if not isinstance(j, dict):
+        raise DataError(f"not a serialized data value: {j!r}")
+    if "$tuple" in j:
+        return tuple(from_json(x) for x in j["$tuple"])
+    if "$dict" in j:
+        return {k: from_json(v) for k, v in j["$dict"].items()}
+    if "$dataclass" in j:
+        return resolve_type(j["$dataclass"])(**{k: from_json(v) for k, v in j["fields"].items()})
+    if "$namedtuple" in j:
+        return resolve_type(j["$namedtuple"])(*(from_json(x) for x in j["items"]))
+    if "$enum" in j:
+        return resolve_type(j["$enum"])[j["name"]]
+    if "$bytes" in j:
+        return bytes.fromhex(j["$bytes"])
+    if "$float" in j:
+        return float(j["$float"])
+    raise DataError(f"not a serialized data value: {j!r}")
+
+
+def treedef_to_json(tree: TreeDef) -> Any:
+    out: dict[str, Any] = {"kind": tree.kind}
+    if tree.type is not None:
+        out["type"] = type_name(tree.type)
+    if tree.keys:
+        out["keys"] = list(tree.keys)
+    if tree.children:
+        out["children"] = [treedef_to_json(c) for c in tree.children]
+    return out
+
+
+def treedef_from_json(j: Any) -> TreeDef:
+    if j["kind"] == "leaf":
+        return LEAF
+    return TreeDef(
+        j["kind"],
+        resolve_type(j["type"]) if "type" in j else None,
+        tuple(j.get("keys", ())),
+        tuple(treedef_from_json(c) for c in j.get("children", ())),
+    )
+
+
+def type_name(t: type) -> str:
+    return f"{t.__module__}:{t.__qualname__}"
+
+
+def resolve_type(name: str) -> Any:
+    """The type `type_name` named. Types defined inside functions can't be resolved."""
+    module, _, qualname = name.partition(":")
+    obj: Any = importlib.import_module(module)
+    for part in qualname.split("."):
+        if part == "<locals>":
+            raise DataError(f"type {name} is local to a function and cannot be loaded")
+        obj = getattr(obj, part)
+    return obj

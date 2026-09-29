@@ -1,0 +1,3 @@
+graph fallback #274dda99 ()
+  %0 = call boom('primary')                   pure  seq=0  features.py:126
+  %1 = deopt: %0 failed while tracing (Boom)  path=[%0]    features.py:126

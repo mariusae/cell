@@ -1,0 +1,5 @@
+graph helpers #4d1da4ca ()
+  %0 = call kv_get('a')  pure  seq=0  features.py:85
+  %1 = call kv_get('b')  pure  seq=1  features.py:85
+  %2 = op %0 + %1                     features.py:85
+  return %2

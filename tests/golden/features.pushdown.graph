@@ -1,0 +1,5 @@
+graph pushdown #09ba393a ()
+  %0 = call sum_keys(('a', 'b'))  effectful[main]  seq=0  features.py:141
+  %1 = call kv_put('sum', %0)     effectful[main]  seq=1  features.py:142
+  %2 = call kv_get('a')           pure  seq=2             features.py:143
+  return %2

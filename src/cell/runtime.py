@@ -12,7 +12,7 @@ import asyncio
 import hashlib
 import itertools
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +22,9 @@ from .core import Cell
 from .errors import ContextError, DataError, DeterminismError
 from .journal import Entry, Err, Journal, Ok, Outcome
 from .semantics import Domain, check_domain
+
+
+type Body = Callable[[Ctx, dict[str, Any]], Awaitable[Any]]
 
 
 class _Interrupt(BaseException):
@@ -66,6 +69,10 @@ class Invocation:
                 "program order is deterministic; to run calls concurrently, issue them and "
                 "await their handles"
             )
+
+    def stop(self) -> None:
+        """Refuse all further calls and sources: each raises the interrupt."""
+        self._interrupt_at = self._next_seq
 
     def _issue(self) -> int:
         seq = self._next_seq
@@ -204,10 +211,30 @@ class Runtime:
         arguments = cell.bind(tuple(args), dict(kwargs or {}))
         data.check(arguments)
         if request_id is None:
-            request_id = replay.request_id if replay is not None else f"r{next(self._request_ids)}"
-        inv = await asyncio.create_task(
-            self._invoke(cell, arguments, (), request_id, replay, interrupt_at)
+            request_id = replay.request_id if replay is not None else self.new_request_id()
+        inv = await self.root(cell, arguments, request_id, replay=replay, interrupt_at=interrupt_at)
+        return self.run_of(inv, replay)
+
+    def new_request_id(self) -> str:
+        return f"r{next(self._request_ids)}"
+
+    async def root(
+        self,
+        cell: Cell,
+        arguments: dict[str, Any],
+        request_id: str,
+        *,
+        replay: Journal | None = None,
+        interrupt_at: int | None = None,
+        make_ctx: Callable[[Invocation], Ctx] = Ctx,
+        body: Body | None = None,
+    ) -> Invocation:
+        """Run a root invocation in its own task. The tracer supplies its own ctx and body."""
+        return await asyncio.create_task(
+            self._invoke(cell, arguments, (), request_id, replay, interrupt_at, make_ctx, body)
         )
+
+    def run_of(self, inv: Invocation, replay: Journal | None = None) -> Run:
         unconsumed: tuple[Entry, ...] = ()
         if replay is not None:
             unconsumed = tuple(
@@ -225,17 +252,22 @@ class Runtime:
         request_id: str,
         replay: Journal | None = None,
         interrupt_at: int | None = None,
+        make_ctx: Callable[[Invocation], Ctx] = Ctx,
+        body: Body | None = None,
     ) -> Invocation:
         inv = Invocation(self, cell, arguments, path, request_id, replay, interrupt_at)
         inv.task = asyncio.current_task()
         result: Any = None
         body_error: Exception | None = None
         try:
-            result = await cell.fn(Ctx(inv), **arguments)
+            ctx = make_ctx(inv)
+            result = await (body(ctx, arguments) if body is not None else cell.fn(ctx, **arguments))
             try:
                 data.check(result)
             except DataError as e:
                 raise DataError(f"{cell.id} returned a value that is not data: {e}") from None
+            if cell.returns_none and result is not None:
+                raise DataError(f"{cell.id} is annotated to return None but returned {type(result).__name__}")
         except _Interrupt:
             inv.interrupted = True
         except Exception as e:

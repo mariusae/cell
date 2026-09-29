@@ -40,9 +40,9 @@ class Receipt:
 
 
 @cell(effects("audit"), domain="audit")
-async def audit(ctx, event: str, order_id: str) -> None:
+async def audit(ctx, event: str, ref: str) -> None:
     w = await service(ctx, "audit")
-    w.effect(ctx, "audit", event=event, order_id=order_id)
+    w.effect(ctx, "audit", event=event, ref=ref)
 
 
 @cell(effects("inventory"))
@@ -95,7 +95,7 @@ async def checkout(ctx, order: Order) -> Receipt:
         raise
     receipt = Receipt(order.id, charge_id, order.amount)
     await notify(ctx, receipt)
-    await audit(ctx, "charged", order.id)
+    await audit(ctx, "charged", charge_id)  # after the charge, by data
     return receipt
 
 
@@ -111,11 +111,11 @@ SCENARIOS = [
         tables=tables,
         expect=Receipt("o1", "ch-2", 300),
         effects=(
-            ("audit", {"event": "attempt", "order_id": "o1"}),
+            ("audit", {"event": "attempt", "ref": "o1"}),
             ("reserve", {"sku": "book", "qty": 2}),
             ("charge", {"card": "good", "amount": 300}),
             ("notify", {"order_id": "o1"}),
-            ("audit", {"event": "charged", "order_id": "o1"}),
+            ("audit", {"event": "charged", "ref": "ch-2"}),
         ),
     ),
     Scenario(
@@ -124,7 +124,7 @@ SCENARIOS = [
         (Order("o2", "lamp", 1, "good", 100),),
         tables=tables,
         raises=OutOfStock,
-        effects=(("audit", {"event": "attempt", "order_id": "o2"}),),
+        effects=(("audit", {"event": "attempt", "ref": "o2"}),),
     ),
     Scenario(
         "checkout/declined",
@@ -133,10 +133,10 @@ SCENARIOS = [
         tables=tables,
         raises=Declined,
         effects=(
-            ("audit", {"event": "attempt", "order_id": "o3"}),
+            ("audit", {"event": "attempt", "ref": "o3"}),
             ("reserve", {"sku": "book", "qty": 1}),
             ("release", {"reservation": "rsv-1"}),
-            ("audit", {"event": "declined", "order_id": "o3"}),
+            ("audit", {"event": "declined", "ref": "o3"}),
         ),
     ),
 ]

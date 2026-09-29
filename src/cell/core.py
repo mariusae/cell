@@ -53,6 +53,11 @@ class Cell:
         return not self.semantics.pure
 
     @functools.cached_property
+    def returns_none(self) -> bool:
+        """Annotated `-> None`. The runtime enforces it, and the tracer relies on it."""
+        return self._sig.return_annotation in (None, "None", type(None))
+
+    @functools.cached_property
     def code_hash(self) -> str:
         return _code_hash(self.fn)
 
@@ -127,7 +132,12 @@ class Op:
         return _code_hash(self.fn)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return self.fn(*args, **kwargs)
+        from .trace import recorder_of
+
+        rec = recorder_of((args, kwargs))
+        if rec is None:
+            return self.fn(*args, **kwargs)
+        return rec.op(self, args, kwargs)
 
     def __repr__(self) -> str:
         return f"<op {self.id}>"
