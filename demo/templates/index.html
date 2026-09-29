@@ -72,15 +72,63 @@
   .chart { border: 1px solid var(--border); border-radius: 8px; padding: 12px; height: 300px; }
   .legend { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .empty { color: var(--muted); padding: 40px 0; }
+  nav h1 a.home { display: inline; padding: 0; color: inherit; font-size: inherit; }
+  nav h1 a.home:hover { background: none; text-decoration: underline; }
+  .about { max-width: 720px; font-size: 15px; line-height: 1.65; }
+  @media (max-width: 760px) {
+    body { flex-direction: column; height: auto; }
+    nav { width: auto; max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--border); }
+    main { overflow: visible; padding: 16px 16px 48px; }
+    .controls { margin: 16px -16px 0; padding: 12px 16px; top: 0; }
+  }
+  .about h2 { font-size: 24px; margin: 8px 0 16px; }
+  .about p { margin: 0 0 14px; }
 </style>
 </head>
 <body>
 <nav>
-  <h1>Cell</h1>
+  <h1><a class="home" href="#">Cell</a></h1>
   <p class="sub">Programs, traced and compiled</p>
   <div id="scenarios"></div>
 </nav>
-<main id="main"><p class="empty">Pick a scenario on the left.</p></main>
+<main id="main"></main>
+<template id="landing">
+  <article class="about">
+    <h2>What is Cell?</h2>
+    <p>Cell is an exploration of a different approach to building and running online serving systems, bringing along ideas
+      from dataflow programming, machine learning frameworks like PyTorch, and database query planners. Traditionally, such
+      systems comprise many different kinds of servers, all communicating via a service mesh. These architectures tend to
+      grow in complexity to meet various needs, and ultimately end up hard-coding many scaling and performance
+      optimizations, like caching, batching, load balancing, admission control, etc. This is because, in this architecture,
+      each server must make local decisions about what to do: where to send a request, whether to cache a response, how
+      concurrent requests can be batched, and so on.</p>
+    <p>What's more: such systems get more unwieldy over time. The very fact that a user request touches 10s-100s of
+      different kinds of servers, and often many replicas of each, makes it difficult to think of "whole program"
+      optimizations. You can also argue it is indicative of poor separation of concerns: it is hard to disentangle the
+      "business logic" -- what the system should do -- from its "execution plan" -- how to go about it.</p>
+    <p>Cell represents such serving systems as explicit dataflow graphs whose nodes represent both pure computation, as
+      well as i/o and other effects, like database queries, view materialization, etc. Once you are operating with this
+      representation, all of the above concerns become graph rewrites: we can insert caching nodes where results are
+      profitably (and safely!) cached; we can insert vectorization operations explicitly; by having a view of the whole
+      graph, we can perform admission control at the point of entry, maximizing our overall goodput. Because we have an
+      explicit graph, we can also implement fault handling centrally: retry policies, and even specify how a system should
+      ("gracefully") degrade in response to overload.</p>
+    <p>In the prototype implementation, the graph is executed by a single node, but it is designed for fully distributed
+      execution: a policy might be applied at the request origin (e.g., at the web server where a user's request lands),
+      and then executed without further coordination.</p>
+    <p>You can view this approach as being analogous to a database's query planner. Whereas a database encodes the
+      "application" in a query, the Cell application is defined in pure Python; a database uses table statistics to make
+      choices, the Cell runtime might use recent latency and failure data. On it goes.</p>
+    <p>In order to provide good ergonomics -- explicit graph representations can be illegible -- Cell provides an
+      imperative programming model, acquiring a graph through <em>tracing</em>. This is exactly how the PyTorch compiler
+      works: the program is guaranteed to behave-as the original Python program executed eagerly, but in practice the
+      system extracts the corresponding dataflow graph through tracing. This does put some limitations on the model -- for
+      example, any source of non-determinism has to be legible to the framework itself -- but makes the program read as a
+      normal Python program would.</p>
+    <p class="muted">Pick a scenario on the left to walk it through the system: eager execution, tracing, rewrites,
+      compiled execution, batching, and simulated load.</p>
+  </article>
+</template>
 
 <script type="module">
 import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
@@ -154,8 +202,20 @@ async function loadScenarios() {
   $("#scenarios").innerHTML = Object.entries(groups).map(([g, ss]) =>
     `<h2>${esc(g)}</h2>` + ss.map((s) => `<a href="#${encodeURIComponent(s.name)}" data-name="${esc(s.name)}">${esc(s.name)}</a>`).join("")
   ).join("");
-  window.onhashchange = () => select(decodeURIComponent(location.hash.slice(1)));
-  if (location.hash) select(decodeURIComponent(location.hash.slice(1)));
+  window.onhashchange = route;
+  route();
+}
+
+function route() {
+  const name = decodeURIComponent(location.hash.slice(1));
+  if (state.scenarios.some((s) => s.name === name)) {
+    select(name);
+    return;
+  }
+  // No scenario selected: the landing page.
+  state.current = null;
+  document.querySelectorAll("nav a").forEach((a) => a.classList.remove("active"));
+  $("#main").replaceChildren($("#landing").content.cloneNode(true));
 }
 
 function select(name) {
